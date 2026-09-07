@@ -26,7 +26,18 @@ draw the blended fluorescence image as a registered background overlay.
 
 Files:
     config/hardware/fluorescence_mosaics.json          — metadata
-    config/hardware/fluor_mosaics/<plate>_<well>_<channel>.png  — per-channel BGR
+    config/hardware/fluor_mosaics/<plate>_<well>_<channel>_<YYYYMMDD-HHMMSS>.png
+
+⚠ **v7.21.6 — A CAPTURE IS NEVER OVERWRITTEN.** The image name used to be
+``<plate>_<well>_<channel>.png``, which is one slot per (plate, well, channel):
+re-scanning A1/FITC truncated the previous PNG *and* replaced its whole metadata
+record, so yesterday's image was unrecoverable. The name now carries the capture
+instant, and the superseded record is moved onto the channel's ``history`` list
+(newest first) instead of being dropped — nothing is lost and nothing is
+orphaned. The ACTIVE capture is still plain ``channels[<name>]``, so every
+reader (:meth:`load_channel_image`, :meth:`get_extent_um`,
+:meth:`composite_overlay`, the workflow overlays, the ND3 export) is unchanged.
+Use :meth:`list_history` / :meth:`restore_history` to reach the older ones.
 
 Metadata layout::
 
@@ -40,12 +51,14 @@ Metadata layout::
           "date": "2026-06-22",
           "channels": {
             "DAPI": {
-              "image": "fluor_mosaics/24_A1_DAPI.png",  # relative to config dir
+              "image": "fluor_mosaics/24_A1_DAPI_20260622-141503.png",
               "color": [0, 0, 255],          # display pseudo-colour, RGB 0-255
               "extent_um": [min_x, min_y, max_x, max_y],   # absolute stage µm
               "shift_um": [dx, dy],          # registration shift baked into extent
               "um_per_px": 0.92, "mosaic_scale": 0.31,
-              "frames": 36, "exposure_us": 0, "date": "2026-06-22"
+              "frames": 36, "exposure_us": 0, "date": "2026-06-22",
+              "captured_at": "2026-06-22T14:15:03",
+              "history": [ {<the same shape, newest first>}, ... ]
             },
             ...
           }
@@ -73,7 +86,7 @@ import json
 import logging
 import os
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -202,9 +215,45 @@ def _safe_token(value) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value)) or "x"
 
 
+#: Capture-stamp format embedded in every image filename (local time).
+CAPTURE_STAMP_FMT = "%Y%m%d-%H%M%S"
+
+
+def capture_stamp(when: Optional[datetime] = None) -> str:
+    """``YYYYMMDD-HHMMSS`` stamp for an image filename."""
+    return (when or datetime.now()).strftime(CAPTURE_STAMP_FMT)
+
+
+def channel_image_name(plate_key, well_name, channel, stamp: str) -> str:
+    """The ONE place a channel image's filename is formed.
+
+    v7.21.6 — the stamp is what makes a re-scan of the same
+    (plate, well, channel) a NEW file instead of an overwrite. Before this the
+    name was ``{plate}_{well}_{channel}.png``, so a second capture of A1/FITC
+    silently truncated the first one's pixels and replaced its metadata; the
+    only reason any older capture survived on this rig is that a machine-id
+    change (ME3B_2 → ME3B_01) happened to fork the whole folder.
+
+    Keep the stamp LAST: every existing tool, sort and glob that groups by
+    ``{plate}_{well}_{channel}`` keeps working, and ``ls`` sorts a channel's
+    captures chronologically.
+    """
+    return (f"{_safe_token(plate_key)}_{_safe_token(well_name)}_"
+            f"{_safe_token(channel)}_{_safe_token(stamp)}.png")
+
+
 def well_key(plate_key, well_name) -> str:
     """Composite metadata key for one (plate, well)."""
     return f"{plate_key}|{well_name}"
+
+
+def _archived(ch_entry: dict) -> dict:
+    """A channel record ready to sit in another record's ``history``.
+
+    Drops the nested ``history`` key — the list is kept FLAT (newest first) on
+    the active record, so archiving N times costs N entries and not 2^N.
+    """
+    return {k: v for k, v in dict(ch_entry).items() if k != "history"}
 
 
 class FluorescenceMosaicStore:
@@ -224,6 +273,7 @@ class FluorescenceMosaicStore:
             self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
                               else self._path.parent / "fluor_mosaics")
         self._data: dict = {"version": "1.0", "wells": {}}
+        self._mtime = None      # set by _load/_save_meta; see _reload_if_changed
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────
@@ -231,6 +281,10 @@ class FluorescenceMosaicStore:
     def _load(self) -> None:
         if not self._path.exists():
             return
+        try:
+            self._mtime = self._path.stat().st_mtime
+        except OSError:
+            self._mtime = None
         try:
             with open(self._path, encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -250,9 +304,35 @@ class FluorescenceMosaicStore:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2)
             os.replace(tmp, self._path)
+            self._mtime = self._path.stat().st_mtime
         except Exception as exc:
             logger.error(
                 f"FluorescenceMosaicStore: failed to save metadata: {exc}")
+
+    def _reload_if_changed(self) -> None:
+        """Re-read the file before mutating it (v7.21.6).
+
+        ⚠ THIS PREVENTS A LOST UPDATE, and it is not theoretical: the app holds
+        this store for its whole session and ``_save_meta`` dumps the ENTIRE
+        ``_data`` dict, so any edit made to the file from outside the app (an
+        import tool, a hand-repair, a second process) is silently reverted by
+        the app's next capture. Observed on ME3B_01: an import completed at
+        17:16 and the running app's 17:28 capture wrote the file back from its
+        own startup-era memory, dropping all 33 imported records.
+
+        Safe because every mutator calls ``_save_meta`` immediately, so
+        in-memory and on-disk never diverge in the other direction — there is
+        never unflushed state for a reload to discard.
+
+        ⚠ The read is UNCONDITIONAL, not gated on mtime. A first cut compared
+        ``st_mtime`` against the value stamped by the last write and skipped the
+        reload when they matched — but an external edit landing inside the same
+        filesystem timestamp tick then reads as "unchanged" and is lost anyway,
+        which a test caught. The file is ~20 kB of JSON against a multi-megabyte
+        PNG write in the same call, so there is nothing to optimise here and a
+        cheap-but-wrong guard is the worse trade.
+        """
+        self._load()
 
     # ── Write ─────────────────────────────────────────────────────
 
@@ -295,8 +375,10 @@ class FluorescenceMosaicStore:
         if not _CV2 or image_bgr is None:
             logger.warning("FluorescenceMosaicStore.save_channel: no cv2 / empty image")
             return False
+        self._reload_if_changed()
         wkey = well_key(plate_key, well_name)
-        fname = f"{_safe_token(plate_key)}_{_safe_token(well_name)}_{_safe_token(channel)}.png"
+        now = datetime.now()
+        fname = self._unique_image_name(plate_key, well_name, channel, now)
         try:
             self._img_dir.mkdir(parents=True, exist_ok=True)
             ok = cv2.imwrite(str(self._img_dir / fname), image_bgr)
@@ -335,7 +417,11 @@ class FluorescenceMosaicStore:
             "mosaic_scale": float(mosaic_scale),
             "frames": int(frames),
             "exposure_us": float(exposure_us),
-            "date": date.today().isoformat(),
+            "date": now.date().isoformat(),
+            # v7.21.6 — full capture instant, so two scans of the same well on
+            # the same day are distinguishable (``date`` alone was not enough,
+            # and it is kept for every pre-v7.21.6 reader).
+            "captured_at": now.isoformat(timespec="seconds"),
         }
         # v7.13 — quantitative-capture metadata. display_lo/hi are the FROZEN
         # per-channel mono16→8-bit levels every averaged tile was converted
@@ -371,16 +457,49 @@ class FluorescenceMosaicStore:
                 pass
         if cube_label:
             ch_entry["cube_label"] = str(cube_label)
-        entry.setdefault("channels", {})[str(channel)] = ch_entry
+        # v7.21.6 — the previous capture is ARCHIVED, not discarded. Its image
+        # file is a different name now (see channel_image_name), so it is still
+        # on disk either way; recording it keeps it FINDABLE (and deletable)
+        # instead of leaving an orphan PNG nothing in the store points at.
+        channels = entry.setdefault("channels", {})
+        prev = channels.get(str(channel))
+        channels[str(channel)] = ch_entry
+        if isinstance(prev, dict) and prev.get("image"):
+            ch_entry["history"] = ([_archived(prev)]
+                                   + list(prev.get("history") or []))
         self._save_meta()
         logger.info(
             f"FluorescenceMosaicStore: saved {plate_key}/{well_name}/{channel} "
-            f"({fname}, extent={ex}, shift={sh})")
+            f"({fname}, extent={ex}, shift={sh})"
+            + (f"; archived {len(ch_entry.get('history') or [])} earlier "
+               f"capture(s)" if ch_entry.get("history") else ""))
         return True
+
+    def _unique_image_name(self, plate_key, well_name, channel,
+                           when: Optional[datetime] = None) -> str:
+        """A filename that does not exist yet — never overwrite pixels.
+
+        The stamp is second-resolution, so two captures inside one second (or a
+        clock stepped backwards) would still collide; a ``-2``, ``-3``, …
+        disambiguator makes the no-overwrite guarantee absolute rather than
+        merely likely.
+        """
+        when = when or datetime.now()
+        base = channel_image_name(plate_key, well_name, channel,
+                                  capture_stamp(when))
+        if not (self._img_dir / base).exists():
+            return base
+        stem = base[:-4]
+        for n in range(2, 1000):
+            cand = f"{stem}-{n}.png"
+            if not (self._img_dir / cand).exists():
+                return cand
+        return f"{stem}-{when.strftime('%f')}.png"
 
     def set_channel_color(self, plate_key, well_name, channel: str,
                           color_rgb: tuple[int, int, int]) -> bool:
         """Update the stored display pseudo-colour for one channel."""
+        self._reload_if_changed()
         ch = self._channel_meta(plate_key, well_name, channel)
         if ch is None:
             return False
@@ -401,11 +520,21 @@ class FluorescenceMosaicStore:
         """
         if not _CV2 or image_bgr is None:
             return False
+        self._reload_if_changed()
         ch = self._channel_meta(plate_key, well_name, channel)
         if ch is None:
             return False
-        fname = (f"{_safe_token(plate_key)}_{_safe_token(well_name)}_"
-                 f"{_safe_token(channel)}_proc.png")
+        # v7.21.6 — derive the name from THIS capture's raw stem so the pair
+        # cannot come apart. With a fixed name a fresh raw stitch would inherit
+        # the previous run's processed file, and the overlays prefer the
+        # processed one — i.e. the display would show a stale image while the
+        # store said it had a new one.
+        raw = str(ch.get("image") or "").rsplit("/", 1)[-1]
+        stem = raw[:-4] if raw.lower().endswith(".png") else raw
+        if not stem:
+            stem = (f"{_safe_token(plate_key)}_{_safe_token(well_name)}_"
+                    f"{_safe_token(channel)}")
+        fname = f"{stem}_proc.png"
         try:
             self._img_dir.mkdir(parents=True, exist_ok=True)
             if not cv2.imwrite(str(self._img_dir / fname), image_bgr):
@@ -471,6 +600,7 @@ class FluorescenceMosaicStore:
         surface model can be re-fit later; ``model`` records the operator's
         chosen evaluation model (plane / linear / spline).
         """
+        self._reload_if_changed()
         wkey = well_key(plate_key, well_name)
         wells = self._data.setdefault("wells", {})
         entry = wells.setdefault(wkey, {
@@ -509,6 +639,7 @@ class FluorescenceMosaicStore:
         return dict(fs) if isinstance(fs, dict) else None
 
     def set_surface_model(self, plate_key, well_name, model: str) -> bool:
+        self._reload_if_changed()
         well = self.get_well(plate_key, well_name)
         if not well or not isinstance(well.get("focus_survey"), dict):
             return False
@@ -774,24 +905,121 @@ class FluorescenceMosaicStore:
 
     # ── Delete ────────────────────────────────────────────────────
 
-    def clear_channel(self, plate_key, well_name, channel) -> None:
+    # ── Capture history (v7.21.6) ─────────────────────────────────
+
+    def list_history(self, plate_key, well_name, channel) -> list[dict]:
+        """Earlier captures of this channel, NEWEST FIRST (never ``None``).
+
+        Each entry is the channel record as it stood when it was superseded —
+        its own ``image`` / ``extent_um`` / ``captured_at`` / exposure / cube,
+        so an archived capture stays fully interpretable (and georeferenced)
+        rather than being a bare filename.
+        """
+        ch = self._channel_meta(plate_key, well_name, channel)
+        if not ch:
+            return []
+        return [dict(h) for h in (ch.get("history") or []) if isinstance(h, dict)]
+
+    def history_count(self, plate_key, well_name, channel) -> int:
+        return len(self.list_history(plate_key, well_name, channel))
+
+    def add_history_entry(self, plate_key, well_name, channel,
+                          record: dict) -> bool:
+        """Register an already-on-disk capture as an ARCHIVED one.
+
+        Used by the importer that folds another machine folder's mosaics in.
+        Its ``image`` must already be a ``fluor_mosaics/<name>.png`` relative
+        path that exists; the list is re-sorted newest-first afterwards so a
+        back-filled older capture lands in the right place.
+        """
+        self._reload_if_changed()
+        ch = self._channel_meta(plate_key, well_name, channel)
+        if ch is None or not isinstance(record, dict) or not record.get("image"):
+            return False
+        hist = [h for h in (ch.get("history") or []) if isinstance(h, dict)]
+        hist.append(_archived(record))
+        hist.sort(key=lambda h: str(h.get("captured_at")
+                                    or h.get("date") or ""), reverse=True)
+        ch["history"] = hist
+        self._save_meta()
+        return True
+
+    def restore_history(self, plate_key, well_name, channel, which) -> bool:
+        """Promote an archived capture back to ACTIVE (a swap, never a delete).
+
+        ``which`` is an index into :meth:`list_history` or an ``image`` path.
+        The capture being displaced goes into the history in its place, so this
+        is reversible and no image is ever dropped.
+        """
+        self._reload_if_changed()
+        ch = self._channel_meta(plate_key, well_name, channel)
+        if ch is None:
+            return False
+        hist = [h for h in (ch.get("history") or []) if isinstance(h, dict)]
+        idx = which if isinstance(which, int) else next(
+            (i for i, h in enumerate(hist)
+             if str(h.get("image", "")).endswith(str(which))), -1)
+        if not (0 <= idx < len(hist)):
+            return False
+        promoted = _archived(hist.pop(idx))
+        hist.insert(0, _archived(ch))
+        hist.sort(key=lambda h: str(h.get("captured_at")
+                                    or h.get("date") or ""), reverse=True)
+        promoted["history"] = hist
+        self.get_well(plate_key, well_name)["channels"][str(channel)] = promoted
+        self._save_meta()
+        logger.info("FluorescenceMosaicStore: restored %s/%s/%s from %s",
+                    plate_key, well_name, channel, promoted.get("captured_at")
+                    or promoted.get("date"))
+        return True
+
+    def clear_channel(self, plate_key, well_name, channel,
+                      include_history: bool = True) -> None:
+        """Forget a channel. ``include_history`` also deletes its archive.
+
+        Default True so a deliberate delete does not leave the archive behind
+        as invisible disk usage; pass False to drop only the active capture and
+        keep the earlier ones (they stay findable — the newest is promoted).
+        """
+        self._reload_if_changed()
         well = self.get_well(plate_key, well_name)
         if not well:
             return
         ch = well.get("channels", {}).pop(str(channel), None)
-        if ch and ch.get("image"):
+        if not ch:
+            self._save_meta()
+            return
+        hist = [h for h in (ch.get("history") or []) if isinstance(h, dict)]
+        if ch.get("image"):
             self._unlink(ch["image"])
+        if ch.get("processed_image"):
+            self._unlink(ch["processed_image"])
+        if include_history:
+            for h in hist:
+                if h.get("image"):
+                    self._unlink(h["image"])
+                if h.get("processed_image"):
+                    self._unlink(h["processed_image"])
+        elif hist:
+            promoted = _archived(hist[0])
+            promoted["history"] = hist[1:]
+            well.setdefault("channels", {})[str(channel)] = promoted
         if not well.get("channels"):
             self._data.get("wells", {}).pop(well_key(plate_key, well_name), None)
         self._save_meta()
 
     def clear_well(self, plate_key, well_name) -> None:
+        self._reload_if_changed()
         well = self._data.get("wells", {}).pop(well_key(plate_key, well_name), None)
         if not well:
             return
         for ch in well.get("channels", {}).values():
-            if ch.get("image"):
-                self._unlink(ch["image"])
+            for rec in [ch] + [h for h in (ch.get("history") or [])
+                               if isinstance(h, dict)]:
+                if rec.get("image"):
+                    self._unlink(rec["image"])
+                if rec.get("processed_image"):
+                    self._unlink(rec["processed_image"])
         self._save_meta()
 
     def _unlink(self, rel: str) -> None:

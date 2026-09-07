@@ -473,7 +473,14 @@ class TestCanvasConstraints(unittest.TestCase):
         c._snap(QPointF(5.02, 0.02))
         self.assertIsNotNone(c._snap_hit)
         kind, idx, anchor = c._snap_hit
-        self.assertEqual((kind, idx, anchor), ("vertex", 0, "p1"))
+        # v7.21.4: (5, 0) is BOTH the line's p1 and its print STOP, and print
+        # points now win the tie — but the anchor is preserved, which is what
+        # keeps the coincident-constraint capture working (asserted below).
+        self.assertEqual((kind, idx, anchor), ("printend", 0, "p1"))
+        c._auto_constrain = True
+        c.sketch().shapes.append(_line((5, 0), (9, 4)))
+        self.assertTrue(c._maybe_add_snap_constraint(1, "p0", c._snap_hit))
+        self.assertEqual(c.sketch().constraints[0].kind, "coincident")
 
     def test_constrained_move_drag_solves_live(self):
         """A move-press on a constrained shape starts a ghost drag; the

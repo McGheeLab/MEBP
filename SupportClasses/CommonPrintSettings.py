@@ -4,7 +4,10 @@ v7.5.x: A central collection (surfaced on the Workflows-mode "Common Print
 Settings" page) of the settings that are common to all workflows. Two classes:
 
   * **Global params** — ``pump_settle_time_s`` (dwell after every discrete
-    syringe move) and ``pump_prime_time_s`` (pre-flow prime). These are
+    syringe move), ``pump_prime_time_s`` (pre-flow prime) and (v7.21.7)
+    ``pump_post_aspirate_dwell_s`` (hold the needle in the liquid after a
+    reagent aspirate, so the compliant column finishes drawing before the tip
+    leaves the fluid). These are
     canonically owned by :class:`HardwareConfig` (the single source of truth the
     controller reads), so this model PROXIES them — ``get``/``set`` of a global
     key read/write the live HardwareConfig attribute. There is one value; no
@@ -37,6 +40,12 @@ logger = logging.getLogger(__name__)
 GLOBAL_KEYS: tuple[str, ...] = (
     "pump_settle_time_s",
     "pump_prime_time_s",
+    # v7.21.7: seconds the needle is held STILL SUBMERGED after a reagent
+    # aspirate finishes, before the retract-and-travel that follows. The pump
+    # move already blocks until the plunger has drained, but a compliant fluid
+    # column keeps drawing in after it stops — lifting Z inside that window
+    # finishes the aspirate in AIR.
+    "pump_post_aspirate_dwell_s",
     # v7.5.x: gentle-Z near the plate — one distance + one speed drive BOTH the
     # slow first-mm LIFT out of a print and the slow last-mm DESCENT back into
     # position, for every workflow (via safe_travel_to / ensure_retracted_to /
@@ -47,6 +56,7 @@ GLOBAL_KEYS: tuple[str, ...] = (
 GLOBAL_DEFAULTS: dict[str, float] = {
     "pump_settle_time_s": 0.0,
     "pump_prime_time_s": 0.25,
+    "pump_post_aspirate_dwell_s": 2.0,
     "gentle_z_slow_dist_mm": 1.0,
     "gentle_z_slow_speed_mm_s": 1.0,
 }

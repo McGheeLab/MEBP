@@ -176,6 +176,10 @@ from SupportClasses.VelocityControl import (   # noqa: E402
     project_on_polyline,
 )
 from SupportClasses import VelocityControl as _velctl   # noqa: E402
+from SupportClasses.ExtrusionProfile import (   # noqa: E402
+    ExtrusionProfile as _ExtrusionProfile,
+    rate_for as _rate_for,
+)
 
 
 @dataclass
@@ -814,6 +818,7 @@ def build_well_plate_job(
     pump_sequence: list[str] | None = None,
     pump_per_layer: dict[str, str] | None = None,
     path_segments: list[list[tuple[float, float]]] | None = None,
+    path_extrusion_profiles: list | None = None,
     return_home: bool = True,
 ) -> PrintJob:
     """
@@ -837,6 +842,15 @@ def build_well_plate_job(
             material across an inter-object seam (e.g. a saved print made of
             several spirals at different offsets). When None, the single
             ``path_points`` list is used — identical to the prior behavior.
+        path_extrusion_profiles: v7.21.5 — OPTIONAL per-sub-path deposition,
+            parallel to ``path_segments``: entry *k* is either None (that
+            sub-path uses the single ``flow_rate``, i.e. legacy) or a list of
+            ``len(path_segments[k]) - 1`` values in **µL per mm of travel**, one
+            per segment. This is how a Print-Builder sketch's own extrusion —
+            each shape's declared line width, and any no-extrude section —
+            reaches the executor, instead of one flow being re-derived for the
+            whole path. A wrong-length entry is dropped (with a warning) rather
+            than applied, because misaligned flow is worse than uniform flow.
         return_home: v7.5.x — when True (default, legacy behavior) the job ends
             with a final ``TRAVEL_UP`` then ``HOME_XY`` (return to the zero
             reference, i.e. XY 0,0). When False the job still ends with the
@@ -1011,6 +1025,23 @@ def build_well_plate_job(
                     "pump": active_pump,
                     "flow_rate": flow_rate,
                 }
+                # v7.21.5: this sub-path's own deposition, when the caller
+                # supplied one. Validated HERE (not in the executor) so a
+                # mismatch is reported once at build time rather than silently
+                # per print.
+                _vpm = None
+                if path_extrusion_profiles and seg_idx < len(
+                        path_extrusion_profiles):
+                    _vpm = path_extrusion_profiles[seg_idx]
+                if _vpm:
+                    if len(_vpm) == len(well_path) - 1:
+                        path_params["vol_per_mm_profile"] = [
+                            float(v) for v in _vpm]
+                    else:
+                        logger.warning(
+                            "extrusion profile for %s has %d entries for %d "
+                            "segments — printing it at a single flow",
+                            seg_label, len(_vpm), len(well_path) - 1)
                 # If flow_rate looks like µL/s (> 0.05), tag as v7.2
                 pump_rate = settings.get_pump_rate(active_pump) if hasattr(settings, 'get_pump_rate') else 0
                 if pump_rate > 0:
@@ -3761,6 +3792,37 @@ class PrintManager:
         except Exception as e:   # pragma: no cover - defensive
             logger.debug(f"print suck-back ({context}) skipped: {e}")
 
+    def _extrusion_profile_for(self, cmd: PrintCommand):
+        """The per-segment deposition (µL/mm) for one ``PRINT_PATH``, or None.
+
+        v7.21.5: a path may carry ``vol_per_mm_profile`` — one entry per segment
+        — so a sketch whose shapes declare different line widths (or mark a
+        section *no extrude*) prints each part at its own rate instead of one
+        flow for the whole path. Absent / malformed → None, and every executor
+        falls back to the scalar ``flow_rate_uL_s``, i.e. the legacy behaviour.
+
+        Built against the RAW ``points`` so an executor that de-duplicates
+        coincident waypoints can still look the profile up by ARC LENGTH, which
+        is unchanged by dropping zero-length segments.
+        """
+        raw = cmd.params.get("vol_per_mm_profile")
+        if not raw:
+            return None
+        prof = _ExtrusionProfile.build(cmd.params.get("points", []), raw)
+        if prof is None:
+            logger.warning(
+                "PRINT_PATH: ignoring a malformed extrusion profile "
+                "(%s entries for %s points) — using the scalar flow",
+                len(raw), len(cmd.params.get("points", []) or []))
+        elif self.exec_logger:
+            lo, hi = prof.printing_span()
+            self.exec_logger.log(
+                "extrusion_profile", n=len(prof.vol_per_mm),
+                uniform=prof.is_uniform,
+                min_uL_per_mm=round(lo, 6), max_uL_per_mm=round(hi, 6),
+                planned_uL=round(prof.total_uL, 5))
+        return prof
+
     def _execute_print_path(self, cmd: PrintCommand):
         """
         Execute a coordinated print path: move XY while extruding.
@@ -3817,6 +3879,9 @@ class PrintManager:
                 and getattr(ctrl, "is_xy_connected", False)):
             self._execute_print_path_open_velocity(cmd)
             return
+
+        # v7.21.5: per-segment deposition for the discrete point stream.
+        _ext_profile = self._extrusion_profile_for(cmd)
 
         # v7.2.7: Set stage speed before print path
         self._set_xy_speed_for_print()
@@ -3884,6 +3949,7 @@ class PrintManager:
             # v7.2: Extrude using µL/s flow rate or legacy ratio
             _seg_vol_uL = 0.0   # v7.5.x exec log: extrusion bookkeeping
             _seg_vol_dropped = False
+            _seg_rate = flow_rate_uL_s   # v7.21.5: per-segment pump rate
             if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0:
                 # Calculate volume from flow rate × segment time
                 # v7.2.7: Use mm/s for extrusion timing
@@ -3892,6 +3958,14 @@ class PrintManager:
                     _ext_speed_mm_s = max(settings.print_feedrate, 1.0) / 60.0
                 seg_time = seg_length / max(_ext_speed_mm_s, 0.01) if _ext_speed_mm_s > 0 else 0
                 volume_uL = flow_rate_uL_s * seg_time
+                # v7.21.5: with a per-segment profile the deposition for THIS
+                # segment comes from the profile (µL/mm × its length) and the
+                # pump rate tracks it, so a wider line is wider instead of
+                # merely slower. Segment i-1 → i (the loop's own indices).
+                if _ext_profile is not None:
+                    _vpm = _ext_profile.at_index(i - 1)
+                    volume_uL = _vpm * seg_length
+                    _seg_rate = _rate_for(_vpm, _ext_speed_mm_s, flow_rate_uL_s)
                 _seg_vol_uL = volume_uL
                 # v7.5.x (Finding C): ACCUMULATE sub-threshold volume instead of
                 # dropping it. A single segment's dispense can round below the
@@ -3906,7 +3980,7 @@ class PrintManager:
                     _emit_uL = _pending_pump_uL
                     _pending_pump_uL = 0.0
                     if hasattr(ctrl, 'move_pump_uL'):
-                        ctrl.move_pump_uL(pump, _emit_uL, flow_rate_uL_s)
+                        ctrl.move_pump_uL(pump, _emit_uL, _seg_rate)
                     else:
                         # v7.4.2: honor configurable per-machine axis_map
                         _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
@@ -3949,7 +4023,7 @@ class PrintManager:
             # fills → board stalls under flow control → USB write faults.
             pump_move_s = 0.0
             if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0 and _seg_vol_uL > 0:
-                pump_move_s = _seg_vol_uL / flow_rate_uL_s
+                pump_move_s = _seg_vol_uL / max(_seg_rate, 1e-9)
             # v7.5.x: pace the XY component by the tuned correction (>1 for a
             # stage that runs slower than commanded, so the loop doesn't outrun
             # the stage → pump stays locked to the needle). Default 1.0 = legacy.
@@ -4122,6 +4196,10 @@ class PrintManager:
         eff_speed = max(0.05, print_speed / max(1.0, _pace))
         vol_per_mm = (flow_rate_uL_s / print_speed) if (
             use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+        # v7.21.5: per-segment deposition, looked up by ARC LENGTH (invariant
+        # under the coincident-point de-dup the followers do). ``vol_per_mm``
+        # above stays the fallback and the "does this path extrude at all" gate.
+        _ext_profile = self._extrusion_profile_for(cmd)
 
         max_um_s = 50000.0
         sl = getattr(ctrl, 'safety_limits', None)
@@ -4192,11 +4270,16 @@ class PrintManager:
 
                 # Deposit pump ∝ the target advance (feed-forward).
                 if ds > 0:
-                    if vol_per_mm > 0:
-                        pending_uL += ds * vol_per_mm
+                    _vpm = vol_per_mm
+                    _rate = flow_rate_uL_s
+                    if _ext_profile is not None:
+                        _vpm = _ext_profile.at_arclen(s_prev)
+                        _rate = _rate_for(_vpm, eff_speed, flow_rate_uL_s)
+                    if _vpm > 0:
+                        pending_uL += ds * _vpm
                         if pending_uL > self._PATH_PUMP_EMIT_MIN_UL:
                             self._emit_pump(ctrl, pump, pending_uL,
-                                            flow_rate_uL_s, settings)
+                                            _rate, settings)
                             pending_uL = 0.0
                     elif not use_uL and flow_rate:
                         self._emit_pump(ctrl, pump, ds * flow_rate, None, settings)
@@ -4234,7 +4317,9 @@ class PrintManager:
             except Exception:
                 pass
 
-        if pending_uL > 0 and vol_per_mm > 0:
+        # v7.21.5: flush the residual whenever anything was accruing —
+        # a profile can deposit where the scalar fallback is 0.
+        if pending_uL > 0 and (vol_per_mm > 0 or _ext_profile is not None):
             self._emit_pump(ctrl, pump, pending_uL, flow_rate_uL_s, settings)
 
         # Feed-forward can't guarantee the EXACT end position (no feedback +
@@ -4308,6 +4393,10 @@ class PrintManager:
         print_speed = max(0.05, float(print_speed))
         vol_per_mm = (flow_rate_uL_s / print_speed) if (
             use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+        # v7.21.5: per-segment deposition by ARC LENGTH — ``s`` here is measured
+        # along the DE-DUPLICATED path, and dropping zero-length segments cannot
+        # change an arc length, so the lookup stays aligned with the raw profile.
+        _ext_profile = self._extrusion_profile_for(cmd)
 
         # v7.5.x: pursuit + corner + PID tuning — tuned by the XY Printing
         # Challenge and stamped on the settings by Quick Print; 0/absent → class
@@ -4526,11 +4615,16 @@ class PrintManager:
 
                 # Deposit pump volume ∝ real distance travelled (non-blocking).
                 if ds > 0:
-                    if vol_per_mm > 0:
-                        pending_uL += ds * vol_per_mm
+                    _vpm = vol_per_mm
+                    _rate = flow_rate_uL_s
+                    if _ext_profile is not None:
+                        _vpm = _ext_profile.at_arclen(s - ds)
+                        _rate = _rate_for(_vpm, print_speed, flow_rate_uL_s)
+                    if _vpm > 0:
+                        pending_uL += ds * _vpm
                         if pending_uL > self._PATH_PUMP_EMIT_MIN_UL:
                             self._emit_pump(ctrl, pump, pending_uL,
-                                            flow_rate_uL_s, settings)
+                                            _rate, settings)
                             pending_uL = 0.0
                     elif not use_uL and flow_rate:
                         self._emit_pump(ctrl, pump, ds * flow_rate, None, settings)
@@ -4561,7 +4655,9 @@ class PrintManager:
                 pass
 
         # Flush residual pump volume + confirm the stage has settled at the end.
-        if pending_uL > 0 and vol_per_mm > 0:
+        # v7.21.5: flush the residual whenever anything was accruing —
+        # a profile can deposit where the scalar fallback is 0.
+        if pending_uL > 0 and (vol_per_mm > 0 or _ext_profile is not None):
             self._emit_pump(ctrl, pump, pending_uL, flow_rate_uL_s, settings)
         self._wait_for_xy_settle(pts[-1][0], pts[-1][1], timeout=10.0,
                                  tolerance=self._VEL_ARRIVE_TOL_UM)
@@ -4682,6 +4778,11 @@ class PrintManager:
         total = cum[-1]
         vol_per_mm = (flow_rate_uL_s / print_speed) if (
             use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+        # v7.21.5: the plan splits the path into sections but the bookkeeping
+        # keeps a GLOBAL arc length (``s_global``), which is exactly what the
+        # profile is indexed by — so the deposition follows the shape being
+        # printed across every section boundary.
+        _ext_profile = self._extrusion_profile_for(cmd)
 
         # SMS / accel / jerk exactly as the legacy path sets them.
         try:
@@ -4744,12 +4845,17 @@ class PrintManager:
             if ds <= 0:
                 return book["total_uL"] if vol_per_mm > 0 else None
             book["s_global"] = s_global
-            if vol_per_mm > 0:
-                book["pending_uL"] += ds * vol_per_mm
-                book["total_uL"] += ds * vol_per_mm
+            _vpm = vol_per_mm
+            _rate = flow_rate_uL_s
+            if _ext_profile is not None:
+                _vpm = _ext_profile.at_arclen(s_global - ds)
+                _rate = _rate_for(_vpm, print_speed, flow_rate_uL_s)
+            if _vpm > 0:
+                book["pending_uL"] += ds * _vpm
+                book["total_uL"] += ds * _vpm
                 if book["pending_uL"] > self._PATH_PUMP_EMIT_MIN_UL:
                     self._emit_pump(ctrl, pump, book["pending_uL"],
-                                    flow_rate_uL_s, settings)
+                                    _rate, settings)
                     book["pending_uL"] = 0.0
                 return book["total_uL"]
             elif not use_uL and flow_rate:
@@ -4839,11 +4945,15 @@ class PrintManager:
         if status == "arrived":
             # Exactness top-up: fold any un-arrived residual (≤ the arrive
             # tolerance per section) into the final emission so the deposited
-            # total is vol_per_mm × total for the plan path.
+            # total is the planned volume for the whole plan path.
             rem = total - book["s_global"]
-            if rem > 0 and vol_per_mm > 0:
-                book["pending_uL"] += rem * vol_per_mm
-        if book["pending_uL"] > 0 and vol_per_mm > 0:
+            if rem > 0:
+                _tail_vpm = (_ext_profile.at_arclen(book["s_global"])
+                             if _ext_profile is not None else vol_per_mm)
+                if _tail_vpm > 0:
+                    book["pending_uL"] += rem * _tail_vpm
+        if book["pending_uL"] > 0 and (vol_per_mm > 0
+                                      or _ext_profile is not None):
             self._emit_pump(ctrl, pump, book["pending_uL"], flow_rate_uL_s,
                             settings)
             book["pending_uL"] = 0.0

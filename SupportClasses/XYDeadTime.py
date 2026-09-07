@@ -91,8 +91,13 @@ def _mad_spread(vals):
     return 1.4826 * _median([abs(v - med) for v in vals])
 
 
-def _fit_line(xs, ys):
-    """Least-squares ``(slope, intercept)``; ``(0, 0)`` if degenerate."""
+def fit_line(xs, ys):
+    """Least-squares ``(slope, intercept)``; ``(0, 0)`` if degenerate.
+
+    v7.21.2: promoted from ``_fit_line`` to a public name so ``XYTopSpeed`` fits its
+    time-vs-distance sweep with the SAME arithmetic, rather than carrying a third
+    copy of least squares (the GUI page had its own).
+    """
     n = len(xs)
     if n < 2:
         return (0.0, 0.0)
@@ -104,6 +109,10 @@ def _fit_line(xs, ys):
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     slope = sxy / sxx
     return (slope, my - slope * mx)
+
+
+#: Back-compat alias — this module's own callers still use the private name.
+_fit_line = fit_line
 
 
 def measure_velocity_dead_time(

@@ -416,6 +416,17 @@ class HardwareConfig:
     # volume = flow × this time just before the print path. (Default matches
     # the legacy Quick Print _PREFLOW_S constant.)
     pump_prime_time_s: float = 0.25
+    # ── v7.21.7: HOLD IN LIQUID AFTER ASPIRATING (s) ──────────────
+    # Extra dwell held with the needle STILL SUBMERGED after a reagent aspirate
+    # (ink / oil / buffer) finishes, BEFORE the needle is retracted and travels
+    # on. `pump_settle_time_s` already blocks until the PLUNGER has drained from
+    # Marlin's planner, but the fluid column is compliant: with a fine bore and
+    # a viscous ink, liquid keeps being drawn in for a while after the plunger
+    # has stopped. If Z lifts in that window the tip is in AIR and the tail of
+    # the aspirate is air, not ink. Default 2 s — the failure it prevents (an
+    # air-filled needle that prints nothing, reported as success) costs far more
+    # than a couple of seconds per reagent pickup. 0 = legacy (no extra hold).
+    pump_post_aspirate_dwell_s: float = 2.0
     # ── v7.5.x: Gentle-Z near the plate (configured on Common Print Settings) ──
     # Every needle motion near a print/work position eases in and out: the first
     # ``gentle_z_slow_dist_mm`` of a LIFT out of a print and the last
@@ -1287,6 +1298,8 @@ class HardwareConfig:
             # v7.5.x: global pump timing
             "pump_settle_time_s": self.pump_settle_time_s,
             "pump_prime_time_s": self.pump_prime_time_s,
+            # v7.21.7: hold the needle in the liquid after an aspirate
+            "pump_post_aspirate_dwell_s": self.pump_post_aspirate_dwell_s,
             # v7.5.x: gentle-Z near the plate (slow lift + slow descent)
             "gentle_z_slow_dist_mm": self.gentle_z_slow_dist_mm,
             "gentle_z_slow_speed_mm_s": self.gentle_z_slow_speed_mm_s,
@@ -1357,6 +1370,11 @@ class HardwareConfig:
                 return default
         config.pump_settle_time_s = _nonneg_float("pump_settle_time_s", 0.0)
         config.pump_prime_time_s = _nonneg_float("pump_prime_time_s", 0.25)
+        # v7.21.7: an ABSENT key takes the 2 s default deliberately — a setup
+        # saved before this existed was written by code that had the air-tail
+        # defect, so inheriting the fix is the intended migration.
+        config.pump_post_aspirate_dwell_s = _nonneg_float(
+            "pump_post_aspirate_dwell_s", 2.0)
         # v7.5.x: gentle-Z near the plate (dist 0 disables; speed kept positive)
         config.gentle_z_slow_dist_mm = _nonneg_float("gentle_z_slow_dist_mm", 1.0)
         config.gentle_z_slow_speed_mm_s = _nonneg_float(

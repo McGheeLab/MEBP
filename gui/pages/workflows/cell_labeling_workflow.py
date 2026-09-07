@@ -498,6 +498,23 @@ class CellLabelingWorkflowPage(QWidget):
             "page — one value used everywhere).")
         sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
                        0.0, common_key="pump_settle_time_s", overridable=False)
+        # v7.21.7: hold the needle in the liquid after a reagent aspirate. A
+        # SEPARATE knob from the settle dwell above, because they cover different
+        # halves of the same move: the settle dwell brackets a pump move that
+        # already blocks until the PLUNGER has drained from Marlin's planner,
+        # while this one covers the FLUID still being drawn in afterwards through
+        # a compliant column. Lift Z inside that window and the tail of the
+        # aspirate is air.
+        self._g_hold_liquid = self._dspin(0.0, 120.0, 2.0, " s", 2, 0.5)
+        self._g_hold_liquid.setToolTip(
+            "Extra time the needle stays IN THE LIQUID after a reagent aspirate "
+            "(ink / oil / buffer) finishes, before Z retracts and the stage "
+            "travels on. Raise it if a pickup ends with air drawn into the "
+            "needle; 0 = no extra hold.")
+        sec.add_common("g_hold_liquid", "Hold in liquid after aspirating",
+                       self._g_hold_liquid, 2.0,
+                       common_key="pump_post_aspirate_dwell_s",
+                       overridable=False)
         sec.add_common("g_prime", "Prime time", self._g_prime, 0.25,
                        common_key="pump_prime_time_s", overridable=False)
 

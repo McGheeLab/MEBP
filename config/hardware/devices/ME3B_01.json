@@ -6,23 +6,23 @@
   "safety_limits": {
     "xy_min_x": 0.0,
     "xy_min_y": 0.0,
-    "xy_max_x": 116604.0,
-    "xy_max_y": 74509.0,
-    "z_min": -17.06,
-    "z_max": 32.94,
-    "p1_min": -34.0,
+    "xy_max_x": 116330.0,
+    "xy_max_y": 74280.0,
+    "z_min": -16.17,
+    "z_max": 33.83,
+    "p1_min": -30.0,
     "p1_max": 0.0,
     "p2_min": 0.0,
     "p2_max": 30.0,
     "p3_min": -30.0,
     "p3_max": 0.0,
-    "max_xy_speed": 10000.0,
+    "max_xy_speed": 5000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
     "enabled": true,
     "max_pump_feedrate_p2": 100.0,
     "max_pump_feedrate_p3": 100.0,
-    "max_pump_feedrate_p1": 35.0
+    "max_pump_feedrate_p1": 95.0
   },
   "zp_stage": {
     "last_port": "COM4",
@@ -66,25 +66,25 @@
     "P2": 100.0,
     "P3": 10000.0
   },
-  "xy_velocity_pct": 80,
+  "xy_velocity_pct": 75,
   "xy_acceleration": 90,
   "xy_jerk": null,
-  "xy_controller_json": "auto",
-  "xy_max_speed_um_s": null,
+  "xy_controller_json": null,
+  "xy_max_speed_um_s": 5000.0,
   "z_up_sign": -1.0,
   "plate_flip_180": null,
-  "needle_cam_z": 35.849999999999994,
+  "needle_cam_z": 42.66,
   "plate_z_offsets": {},
   "needle_loc_xy_um": [
-    10547.0,
-    38377.0
+    12320.0,
+    38213.0
   ],
   "pump_setup": {
     "P1": {
       "raw_dispensed": 0.0,
-      "raw_aspirated": -34.0,
+      "raw_aspirated": -30.0,
       "aspirate_sign": -1.0,
-      "capacity_uL": 113.33333333333334
+      "capacity_uL": 100.0
     }
   },
   "pump_compliance_uL": {

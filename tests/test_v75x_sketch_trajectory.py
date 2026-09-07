@@ -124,7 +124,15 @@ class TestSketchCompiler(unittest.TestCase):
 
     # ── Thickness (bead width / multi-pass) ──────────────────────────
 
-    def test_thick_outline_multipass(self):
+    def test_thick_outline_is_still_a_single_pass(self):
+        """v7.21.4 — REPLACES ``test_thick_outline_multipass``.
+
+        A wider declared line width no longer expands into adjacent parallel
+        passes: it prints ONE bead on the drawn geometry, and the width is
+        reached by raising the extrusion multiplier instead. The old contract
+        (>3x the length and volume at 2.0 mm vs 0.4 mm) is exactly what must
+        NOT happen any more.
+        """
         thin = compile_to_trajectory(
             Sketch(shapes=[SketchShape(kind="circle", cx=0, cy=0, radius=10,
                                        line_width_mm=0.4)],
@@ -133,9 +141,12 @@ class TestSketchCompiler(unittest.TestCase):
             Sketch(shapes=[SketchShape(kind="circle", cx=0, cy=0, radius=10,
                                        line_width_mm=2.0)],
                    line_spacing_mm=0.4))
-        # A 2 mm bead at 0.4 mm spacing → ~5 concentric passes.
-        self.assertGreater(thick.total_length_mm, thin.total_length_mm * 3)
-        self.assertGreater(thick.total_volume_uL, thin.total_volume_uL * 3)
+        self.assertAlmostEqual(thick.total_length_mm, thin.total_length_mm,
+                               places=6)
+        # v7.21.5: the width now drives that shape's FLOW instead of its
+        # geometry — 5x the width, 5x the deposition, same single pass.
+        self.assertAlmostEqual(thick.total_volume_uL,
+                               thin.total_volume_uL * 5.0, places=9)
 
     # ── Paint-bucket fill ────────────────────────────────────────────
 

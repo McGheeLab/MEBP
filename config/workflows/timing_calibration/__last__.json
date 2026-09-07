@@ -2,13 +2,13 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "timing_calibration",
   "name": "__last__",
-  "saved": "2026-08-13T13:44:47",
+  "saved": "2026-08-17T18:56:01",
   "values": {
-    "maxn": 8,
-    "seg": 0.7,
     "speed": 5.0,
+    "res_um": 30.0,
+    "feature_mm": 2.0,
+    "topdist": 10.0,
     "reps": 2,
-    "still": 0.35,
-    "topdist": 10.0
+    "still": 0.35
   }
 }

@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "cell_targeting",
   "name": "__last__",
-  "saved": "2026-08-14T16:01:53",
+  "saved": "2026-09-01T13:36:04",
   "values": {
     "service_z": 0.5,
     "service_z__ovr": false,
@@ -25,6 +25,7 @@
     "z_timeout": 15.0,
     "xy_timeout": 30.0,
     "g_settle": 0.0,
+    "g_hold_liquid": 2.0,
     "g_prime": 0.25,
     "removal_z": 0.1,
     "place_z": 0.5,

@@ -37,6 +37,7 @@ from SupportClasses.GeometryEngine import (
 )
 from SupportClasses.PhysicalModels import (
     needle_orifice_area_mm2,
+    needle_orifice_id_um,
     needle_orifice_od_mm,
 )
 
@@ -112,7 +113,13 @@ class SketchShape:
     points: list[tuple[float, float]] = field(default_factory=list)
 
     filled: bool = False
-    line_width_mm: float = 0.4   # printed bead width — render + multi-pass + volume
+    # v7.21.4: the TARGET printed bead width (mm). It is a DECLARATION, not a
+    # toolpath instruction: the compiler lays exactly ONE pass per outline and
+    # never synthesises adjacent parallel lines to fill this width — the
+    # operator reaches it by raising ``Sketch.extrusion_multiplier`` (see
+    # ``_pass_offsets``). Used for reporting / the width-vs-extrusion match
+    # hint on the Sketch page.
+    line_width_mm: float = 0.4
     # Abstract ink this shape prints with — a STABLE id into ``Sketch.inks``,
     # NOT a physical pump (the sketch is pump-agnostic; see SketchInk). Legacy
     # sketches migrate the old ``pump_index`` → ``ink_id`` (P1→1,P2→2,P3→3) in
@@ -392,6 +399,21 @@ class Sketch:
     # laid, not WHERE the needle goes (the toolpath geometry is unchanged).
     extrusion_multiplier: float = 1.0
 
+    # v7.21.5: when True each shape's declared ``line_width_mm`` scales its OWN
+    # deposition — modifier(shape) = extrusion_multiplier x line_width_mm /
+    # reference_bead_width — so a sketch with several line widths prints each at
+    # its own width and the per-segment profile that ships to Quick Print has
+    # real content. ``extrusion_multiplier`` stays a global trim on top.
+    #
+    # Defaults True for a NEW sketch and **False for any sketch loaded from a
+    # dict without the key** (see ``from_dict``): before v7.21.5 a shape's
+    # width had no effect on volume, and new shapes were seeded from the
+    # orifice OUTER diameter while 1x is the INNER diameter, so switching a
+    # saved sketch on silently multiplies its deposition by od/id (~1.7x on a
+    # hypodermic needle). Opting an old sketch in is the operator's call, and
+    # the page states the consequence.
+    width_drives_extrusion: bool = True
+
     # v7.5.x: single-needle vs multi-needle/channel mode.
     #   None  → AUTO: derive from the needle (num_channels ≤ 1 ⇒ single).
     #   True  → single needle: only one material at the tip at a time, so a
@@ -572,6 +594,7 @@ class Sketch:
             "outline_points_per_mm": self.outline_points_per_mm,
             "flow_factor": self.flow_factor,
             "extrusion_multiplier": self.extrusion_multiplier,
+            "width_drives_extrusion": bool(self.width_drives_extrusion),
         }
         # Emit single_needle only when explicitly set (not AUTO) → legacy dicts
         # stay byte-identical.
@@ -618,6 +641,10 @@ class Sketch:
         sk.outline_points_per_mm = float(d.get("outline_points_per_mm", 2.0))
         sk.flow_factor = float(d.get("flow_factor", 1.0))
         sk.extrusion_multiplier = float(d.get("extrusion_multiplier", 1.0))
+        # ABSENT means a pre-v7.21.5 sketch, whose stored line widths were never
+        # an extrusion instruction — default OFF so re-baking it deposits
+        # exactly what it always did.
+        sk.width_drives_extrusion = bool(d.get("width_drives_extrusion", False))
         sk.overlap_travel_enabled = bool(d.get("overlap_travel_enabled", False))
         sk.overlap_travel_max_mm = float(d.get("overlap_travel_max_mm", 5.0))
         sk.overlap_travel_pause_pump = bool(
@@ -643,6 +670,18 @@ class CompiledSketch:
 
     trajectory: np.ndarray                    # Nx7 [x,y,z,p1,p2,p3,t]
     pump_states: list[list[float]]            # per-waypoint [f1,f2,f3] (preview)
+    # v7.21.5 — THE EXTRUSION ALONG THE PATH, one entry per SEGMENT (waypoint
+    # i -> i+1), so len == len(trajectory) - 1:
+    #   ``extrusion_profile``  the extrusion MODIFIER actually applied
+    #                          (bore-relative; 0.0 on a travel / no-extrude
+    #                          segment), and
+    #   ``vol_per_mm_profile`` the same thing in absolute microlitres per mm.
+    # Both are baked into the print file so Quick Print prints what the sketch
+    # computed instead of re-deriving one flow for the whole path.
+    extrusion_profile: list[float] = field(default_factory=list)
+    vol_per_mm_profile: list[float] = field(default_factory=list)
+    #: the width that a 1x bead is (mm) — the reference the modifier is against
+    extrusion_ref_width_mm: float = 0.0
     total_length_mm: float = 0.0
     total_volume_uL: float = 0.0
     total_time_s: float = 0.0
@@ -1074,16 +1113,33 @@ def _polygon_fill(pts, spacing) -> np.ndarray:
 
 
 def _pass_offsets(line_width: float, bead: float) -> list[float]:
-    """Centered perpendicular offsets for a multi-pass thick outline.
+    """Perpendicular pass offsets for one outline — ALWAYS a single pass.
 
-    A bead of width ``bead`` is laid per pass; ``n`` passes reach
-    ``line_width``. Returns offsets symmetric about 0 (e.g. n=3, bead=0.4 →
-    [-0.4, 0, 0.4]).
+    v7.21.4 (operator): *"do not auto calculate the need for multiple lines to
+    fill in the width of any line. We will set that line width and just
+    increase the extrusion modifier to match."*
+
+    Before this, an outline whose ``line_width_mm`` exceeded the fill pitch was
+    silently expanded into ``round(line_width / bead)`` adjacent parallel
+    passes (a 2 mm width at a 0.4 mm pitch → 5 concentric passes). That made
+    ONE drawn line print as five, each offset from the geometry the operator
+    drew — so the outer pass sat half the width outside the sketched shape,
+    the path length (and therefore volume and time) jumped 5×, and the width
+    was reached by geometry rather than by flow.
+
+    Now the width is reached by FLOW: exactly one bead is laid on the drawn
+    geometry and ``Sketch.extrusion_multiplier`` scales how much is deposited
+    (the Sketch page reports the × needed to match a shape's declared
+    ``line_width_mm``, and its shaded band shows the width that × predicts).
+
+    Kept as a function — rather than deleting it — so every shape branch below
+    keeps one uniform "for each pass" shape, and so re-introducing multi-pass
+    (if it is ever wanted as an explicit, opt-in mode) is a change in ONE
+    place instead of five.
+
+    ``line_width``/``bead`` are accepted and ignored.
     """
-    n = max(1, int(round(line_width / bead))) if line_width > bead else 1
-    if n == 1:
-        return [0.0]
-    return [(k - (n - 1) / 2.0) * bead for k in range(n)]
+    return [0.0]
 
 
 # Outline kinds whose toolpath start point can be repositioned (Feature: print
@@ -1235,9 +1291,9 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
 
     # Each printed pass lays a bead of width ``bead`` (the fill gap), so the
     # deposited cross-section per mm of travel is bead × layer_height.
-    # Thick outlines emit several adjacent passes, which sums to the bead
-    # width the user asked for — keeping volume coherent across fills and
-    # multi-pass outlines.
+    # v7.21.4: an outline is ALWAYS one pass (see ``_pass_offsets``) — a wider
+    # declared ``line_width_mm`` is reached by raising the extrusion
+    # multiplier, never by emitting adjacent parallel lines.
     bead = max(sketch.line_spacing_mm, 1e-3)      # fill raster pitch (geometry)
     # v7.5.x (Finding A) — UNIFY on the canonical F-1 bead model: deposited
     # volume per mm of travel = the needle's INNER-BORE cross-section × the
@@ -1252,25 +1308,73 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
     # no needle is supplied (bore unknown) fall back to bead × layer_height ×
     # mult so the no-syringe preview stays monotonic and previewable.
     # v7.6: "bore" is the ORIFICE — the pulled tip when present, else the barrel.
+    # v7.21.5: split into a BASE (per unit modifier) and a per-shape modifier.
+    # base_vol_per_mm is the deposition at modifier 1.0 — the orifice
+    # cross-section — and ``_shape_modifier`` below turns each shape's declared
+    # ``line_width_mm`` into its own multiple of it. ``ref_width_mm`` is the
+    # width a 1.0x bead is, i.e. the reference the modifier is measured
+    # against: the orifice INNER diameter, matching the Sketch page's shaded
+    # band and its "this width needs Nx" readout, so what the page reports is
+    # what the compiler applies.
     mult = max(float(getattr(sketch, "extrusion_multiplier", 1.0)), 0.0)
-    vol_per_mm = bead * sketch.layer_height_mm * mult
+    base_vol_per_mm = bead * sketch.layer_height_mm
+    ref_width_mm = bead
     if needle is not None:
         try:
             _area = float(needle_orifice_area_mm2(needle) or 0.0)
             if _area > 0:
-                vol_per_mm = _area * mult
+                base_vol_per_mm = _area
         except (TypeError, ValueError):
             pass
+        try:
+            _id = float(needle_orifice_id_um(needle) or 0.0) / 1000.0
+            if _id > 0:
+                ref_width_mm = _id
+        except (TypeError, ValueError):
+            pass
+    width_scaled = bool(getattr(sketch, "width_drives_extrusion", False))
+
+    def _shape_modifier(shape) -> float:
+        """The extrusion modifier for one shape.
+
+        ``extrusion_multiplier`` is the sketch-wide trim; when
+        ``width_drives_extrusion`` is on, a shape's declared ``line_width_mm``
+        scales it by how many reference beads wide that line is — which is what
+        makes the per-segment profile shipped to Quick Print meaningful, and
+        what makes a declared width actually print at that width now that an
+        outline is a single pass (v7.21.4).
+
+        ``no_print`` is deliberately NOT checked here: ``move_to`` already
+        zeroes a non-printing segment via its ``printing`` flag, which is the
+        single enforcement point (it also covers travel, lifts and the
+        hold-pressure retrace). A second check here proved to be dead code — a
+        mutation removing it changed nothing.
+        """
+        m = mult
+        if width_scaled and ref_width_mm > 0:
+            try:
+                lw = float(getattr(shape, "line_width_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                lw = 0.0
+            if lw > 0:
+                m *= lw / ref_width_mm
+        return max(0.0, m)
+
+    # The modifier of the shape currently being emitted; ``move_to`` reads it so
+    # every segment is stamped with the extrusion actually applied to it.
+    cur_mod = mult
     # Two paths "connect" — and print as one continuous bead with no pen-up —
     # when an endpoint of the next sits within half a bead of where the last
-    # left off (their deposited beads already overlap). Half a bead is tight
-    # enough never to fuse the adjacent parallel passes of a thick outline,
-    # which are a full bead apart.
+    # left off (their deposited beads already overlap). Half a bead keeps the
+    # weld tight: a line JOINED to another shape's print start/stop on the
+    # Sketch canvas lands exactly on it, so it welds; a line merely passing
+    # nearby does not.
     weld_tol = max(bead * 0.5, 1e-3)
+    # Plunger mm per mm of travel, at modifier 1.0 (scaled per shape below).
     if syringe is not None:
-        pump_per_mm = vol_per_mm * syringe.mm_per_uL
+        base_pump_per_mm = base_vol_per_mm * syringe.mm_per_uL
     else:
-        pump_per_mm = max(sketch.flow_factor, 1e-6) * mult
+        base_pump_per_mm = max(sketch.flow_factor, 1e-6)
 
     # Single-needle mode (one material at the tip at a time): a pump/channel
     # change between connected shapes cannot weld — it needs an ink replacement
@@ -1317,6 +1421,12 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
                      * max(float(getattr(sketch, "overlap_travel_speed_factor",
                                          1.0) or 1.0), 1e-3))
 
+    # v7.21.5 — per-SEGMENT extrusion, filled in lockstep with ``waypoints`` by
+    # ``move_to`` (so it can never drift out of alignment with the toolpath).
+    ext_profile: list[float] = []
+    vpm_profile: list[float] = []
+    total_vol = 0.0
+
     def move_to(x: float, y: float, z: float, printing: bool, pump: int,
                 speed: float | None = None, pump_creep: float = 0.0):
         """Append a waypoint. ``speed`` (when given) overrides the segment speed
@@ -1326,7 +1436,7 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
         downstream travel-detection threshold (1e-9) so Quick Print's
         ``_travel_mask`` does NOT split it into a pen-up/pressure-relief, while
         depositing ~nothing (the pump holds pressure, not stops)."""
-        nonlocal t, last, total_len
+        nonlocal t, last, total_len, total_vol
         if last is None:
             waypoints.append([x, y, z, pump_disp[0], pump_disp[1],
                               pump_disp[2], t])
@@ -1334,9 +1444,18 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
             last = (x, y, z)
             return
         dist = math.dist(last, (x, y, z))
+        # v7.21.5: the modifier in force for THIS segment (``cur_mod`` is set by
+        # the shape loop). A travel / hold-pressure segment deposits nothing, so
+        # its profile entry is 0.0 — which is also what tells a downstream
+        # consumer where the bead stops.
+        seg_mod = 0.0
+        seg_vpm = 0.0
         if printing and dist > 0:
-            pump_disp[pump] += dist * pump_per_mm
+            seg_mod = cur_mod
+            seg_vpm = base_vol_per_mm * cur_mod
+            pump_disp[pump] += dist * base_pump_per_mm * cur_mod
             total_len += dist
+            total_vol += dist * seg_vpm
             # Colour the segment LEAVING the previous waypoint (preview).
             pump_states[-1][pump] = 1.0
             seg_speed = sketch.print_speed_mm_s if speed is None else speed
@@ -1344,12 +1463,15 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
             if pump_creep > 0 and dist > 0:
                 # Hold-pressure creep: enough to clear the 1e-9 travel threshold
                 # (so it isn't split as a pen-up) but volumetrically negligible.
-                pump_disp[pump] += max(dist * pump_per_mm * pump_creep, 1e-6)
+                pump_disp[pump] += max(
+                    dist * base_pump_per_mm * cur_mod * pump_creep, 1e-6)
             seg_speed = sketch.travel_speed_mm_s if speed is None else speed
         t += dist / max(seg_speed, 1e-9)
         waypoints.append([x, y, z, pump_disp[0], pump_disp[1],
                           pump_disp[2], t])
         pump_states.append([0.0, 0.0, 0.0])
+        ext_profile.append(seg_mod)
+        vpm_profile.append(seg_vpm)
         last = (x, y, z)
 
     def lift_out(z_target: float):
@@ -1393,6 +1515,10 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
             z = max(0.0, z_layer + float(getattr(shape, "z_offset_mm", 0.0)
                                          or 0.0))
             do_print = not bool(getattr(shape, "no_print", False))
+            # v7.21.5: this shape's own extrusion modifier — read by ``move_to``
+            # for every segment it emits, so the per-segment profile records the
+            # extrusion actually applied and a wider line really is wider.
+            cur_mod = _shape_modifier(shape)
             # Closure overlap: continue a closed loop past its seam by the
             # per-shape amount (needle Ø / typed distance; closed unfilled only).
             overlap_mm = (shape.overlap_amount_mm(_od, bead)
@@ -1435,8 +1561,8 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
                 # optimizer marked this shape (retrace_from) and its start is
                 # reachable along the last printed pass within the cap, stay
                 # DOWN and walk the bead there (faster and/or pump paused). Only
-                # on the FIRST pass of a shape — a shape-to-shape connection, not
-                # between a thick outline's own concentric passes.
+                # on the FIRST pass of a shape — a shape-to-shape connection
+                # (an outline is one pass; a fill can still emit several).
                 if (retrace_on and first_shape_pass and not welded
                         and last is not None and prev_print_path is not None
                         and ink_ok and abs(last[2] - z) < 1e-6
@@ -1475,7 +1601,8 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
 
     if len(waypoints) < 2:
         return CompiledSketch(trajectory=np.zeros((0, 7)), pump_states=[],
-                              num_layers=num_layers)
+                              num_layers=num_layers,
+                              extrusion_ref_width_mm=ref_width_mm)
 
     traj = np.asarray(waypoints, dtype=np.float64)
     minx, miny = float(traj[:, 0].min()), float(traj[:, 1].min())
@@ -1484,8 +1611,15 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
     return CompiledSketch(
         trajectory=traj,
         pump_states=pump_states,
+        # One entry per segment, by construction (``move_to`` appends exactly
+        # one per emitted waypoint after the first).
+        extrusion_profile=ext_profile,
+        vol_per_mm_profile=vpm_profile,
+        extrusion_ref_width_mm=ref_width_mm,
         total_length_mm=total_len,
-        total_volume_uL=total_len * vol_per_mm,
+        # v7.21.5: SUMMED per segment (was total_len x one scalar) — with a
+        # per-shape modifier the two are no longer the same number.
+        total_volume_uL=total_vol,
         total_time_s=float(traj[-1, 6]),
         num_layers=num_layers,
         num_waypoints=len(traj),
@@ -1802,11 +1936,10 @@ def plan_print_sections(sketch: Sketch, needle=None,
     user retract point (``move`` = quick move / reposition, ``ink_change`` =
     single-needle ink change, ``layer`` = different print height).
 
-    Sections group by OBJECT (each drawn shape is one section): a thick multi-
-    pass outline lifts internally between its concentric passes, but that is
-    intra-object and NOT shown as a break here. Computed for layer 0; odd layers
-    reverse each pass (serpentine), so their inter-shape welds can differ
-    slightly — the panel shows the layer-0 sequence."""
+    Sections group by OBJECT (each drawn shape is one section, one pass since
+    v7.21.4). Computed for layer 0; odd layers reverse each pass (serpentine),
+    so their inter-shape welds can differ slightly — the panel shows the
+    layer-0 sequence."""
     single = (sketch.is_single_needle(needle) if single_needle is None
               else bool(single_needle))
     tol = _weld_tol_for(sketch)
@@ -1847,7 +1980,8 @@ def plan_print_sections(sketch: Sketch, needle=None,
         p_last = np.asarray(paths[-1], dtype=np.float64)
         # The FIRST pass's endpoints drive the weld to the previous shape; the
         # shape's EXIT (what the next shape connects to) is the LAST pass's end
-        # — mirroring the compiler's running ``last`` for a multi-pass outline.
+        # — mirroring the compiler's running ``last``. Outlines are one pass
+        # (v7.21.4) so first == last there; fills may still emit several.
         fs = (float(p_first[0, 0]), float(p_first[0, 1]))
         fe = (float(p_first[-1, 0]), float(p_first[-1, 1]))
         ink_id = int(sh.ink_id)                    # abstract ink (weld gate)

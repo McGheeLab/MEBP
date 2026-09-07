@@ -1,0 +1,2 @@
+{"event": "config", "kind": "top_speed_sweep", "distances_mm": [2.0, 4.0, 6.0, 8.0, 10.0], "repeats": 2, "still_window_s": 0.35}
+{"event": "fit", "slope_s_per_mm": 0.0, "intercept_s": 0.0, "top_speed_mm_s": null}

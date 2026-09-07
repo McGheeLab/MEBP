@@ -180,6 +180,13 @@ class ReadinessContext:
     path_length_mm: Optional[float] = None
     n_strokes: Optional[int] = None
     bead_width_um: Optional[float] = None
+    # v7.21.5 — the print carries its OWN per-segment extrusion (a Print-Builder
+    # sketch bakes one modifier per path segment from each shape's declared line
+    # width). ``extrusion_span`` is the EFFECTIVE (trim included) min/max
+    # modifier over the printing segments; ``extrusion_trim`` is the operator's
+    # own Extrusion ×. Both None → one flow for the whole path (legacy).
+    extrusion_span: Optional[tuple] = None
+    extrusion_trim: Optional[float] = None
     flow_uL_s: Optional[float] = None
 
     # ── geometry fit ──
@@ -473,9 +480,26 @@ def _print_params(ctx: ReadinessContext, add) -> None:
     if bead is not None and bead > 0:
         flow = _num(ctx.flow_uL_s)
         detail = f"~{bead:.0f} µm wide"
+        if ctx.extrusion_span:
+            detail = f"up to ~{bead:.0f} µm wide"
         if flow:
             detail += f" at {flow:.3f} µL/s"
         add(Check("bead", "Print", "Deposited line", INFO, detail))
+
+    # v7.21.5: the print's own extrusion, when it brought one. Stated because
+    # it OVERRIDES the single auto-calculated flow — an operator whose
+    # "Extrusion ×" looks ignored needs to see what actually governs the bead.
+    if ctx.extrusion_span:
+        lo, hi = (float(ctx.extrusion_span[0]), float(ctx.extrusion_span[1]))
+        trim = _num(ctx.extrusion_trim)
+        span = (f"×{hi:.2f}" if abs(hi - lo) <= 1e-9
+                else f"×{lo:.2f}–{hi:.2f} along the path")
+        detail = f"from the print itself, {span}"
+        if trim is not None and abs(trim - 1.0) > 1e-9:
+            detail += f" (includes your ×{trim:g} trim)"
+        else:
+            detail += " — your Extrusion × trims it"
+        add(Check("extrusion", "Print", "Extrusion", INFO, detail))
 
 
 def _fluidics(ctx: ReadinessContext, add) -> None:

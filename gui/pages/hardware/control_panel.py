@@ -1275,17 +1275,35 @@ class HardwareControlPanel(QWidget):
         s = self._settings
         sl = getattr(ctrl, "safety_limits", None) if ctrl is not None else None
         if group == "xy":
-            if sl is not None:
-                try:
-                    sl.max_xy_speed = value
-                except Exception:
-                    pass
-            if s is not None:
-                try:
-                    s.set("safety_limits.max_xy_speed", value)
-                    s.save()
-                except Exception:
-                    pass
+            # v7.21.2: delegate to the ONE writer. This branch used to set
+            # `safety_limits.max_xy_speed` and nothing else — moving the 100 %
+            # anchor every jog/print percentage reads while leaving the XYStage
+            # still converting mm/s against a stale denominator, so every
+            # commanded speed came out wrong by the ratio of the two. It also
+            # never wrote `device_profile.xy_max_speed_um_s`, so the value did
+            # not survive a restart, nor the timing store the simulator reads.
+            try:
+                from SupportClasses.PrintTimingCalibrationStore import (
+                    get_store as _get_tc_store,
+                )
+                from SupportClasses.XYCalibrationRun import commit_top_speed
+                commit_top_speed(ctrl, s, _get_tc_store(), float(value))
+                if ctrl is not None and hasattr(
+                        ctrl, "notify_speed_limits_changed"):
+                    ctrl.notify_speed_limits_changed()
+            except Exception as e:
+                logger.debug(f"_write_axis_max(xy) delegate failed: {e}")
+                if sl is not None:
+                    try:
+                        sl.max_xy_speed = value
+                    except Exception:
+                        pass
+                if s is not None:
+                    try:
+                        s.set("safety_limits.max_xy_speed", value)
+                        s.save()
+                    except Exception:
+                        pass
         elif group == "z":
             per_axis = {}
             if s is not None:

@@ -322,6 +322,25 @@ class WorkflowsModePage(QWidget):
                 except Exception as e:
                     logger.debug("set_common_print_settings fanout failed: %s", e)
 
+    def refresh_speed_limits(self):
+        """v7.21.2: forward the speed-limit broadcast to the workflow pages.
+
+        ``MainWindow._refresh_all_speed_limits`` walks the top-level pages and their
+        jog/control panels, but the workflow pages live inside this mode page's
+        stack — so without this forwarder Quick Print never learned that the XY
+        calibration had just changed the machine's top speed, and kept showing a
+        stale speed cap and a stale "stage motion not characterised" warning until
+        the app was restarted.
+        """
+        for i in range(1, self._stack.count()):
+            page = self._stack.widget(i)
+            fn = getattr(page, "refresh_speed_limits", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as e:
+                    logger.debug("refresh_speed_limits fanout failed: %s", e)
+
     def set_well_list(self, wells: list[str]):
         for i in range(1, self._stack.count()):
             page = self._stack.widget(i)

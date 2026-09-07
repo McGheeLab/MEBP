@@ -1,0 +1,381 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "PacMan",
+    "description": "PacMan: 8 shape(s), 1 layer(s), 45.4 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-08-15T00:54:43.127283+00:00",
+    "modified": "2026-08-15T00:54:43.127283+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "PacMan": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\PacMan.csv",
+        "csv_path": "config\\prints\\PacMan.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 156,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.37376308852061546,
+                  -1.443914634865518
+                ],
+                [
+                  -2.2613128828460267,
+                  -0.04018912504108393
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 15
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.2613128826649533,
+                  -0.040189129822036374
+                ],
+                [
+                  -0.3295728521946647,
+                  1.3263430532019538
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -2.6324185603386816,
+                -0.024066894234907626
+              ],
+              "id": 16
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.3295728511861622,
+                  1.3263430554963032
+                ],
+                [
+                  -2.2613128831988845,
+                  -0.04018911515633708
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -0.7108991488342484,
+                1.368388201339303
+              ],
+              "id": 17
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.2613128826649533,
+                  -0.040189129822036374
+                ],
+                [
+                  -0.3737630892344739,
+                  -1.4439146344787583
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -2.6324185603386816,
+                -0.024066894234907626
+              ],
+              "id": 18
+            },
+            {
+              "kind": "circle",
+              "cx": -3.008577348626054,
+              "cy": -0.016403649392855,
+              "radius": 2.996670452192541,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                0.9017720077194434,
+                -2.357184886429529
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 3.034,
+              "id": 11
+            },
+            {
+              "kind": "circle",
+              "cx": 1.6379703695525791,
+              "cy": 0.011206556135923862,
+              "radius": 0.5,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 5,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                0.6394688014963794,
+                0.4729286543982662
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.561,
+              "id": 12
+            },
+            {
+              "kind": "circle",
+              "cx": 3.7865793369757377,
+              "cy": -0.014090562703016285,
+              "radius": 0.5,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 5,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.9276381074073337,
+                -0.027895994609493262
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.573,
+              "id": 13
+            },
+            {
+              "kind": "circle",
+              "cx": 5.780333812350937,
+              "cy": 0.017516939163832845,
+              "radius": 0.5,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 5,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                4.921392582782533,
+                0.0037115072573558673
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.561,
+              "id": 14
+            }
+          ],
+          "inks": [
+            {
+              "id": 1,
+              "name": "3 Boxes",
+              "color": "#89b4fa"
+            },
+            {
+              "id": 5,
+              "name": "1 Box",
+              "color": "#a6e3a1"
+            }
+          ],
+          "_next_ink_id": 6,
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 4.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 1.067,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0,
+          "constraints": [
+            {
+              "id": 8,
+              "kind": "point_on",
+              "refs": [
+                [
+                  15,
+                  "p0"
+                ],
+                [
+                  11,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 9,
+              "kind": "coincident",
+              "refs": [
+                [
+                  16,
+                  "p0"
+                ],
+                [
+                  15,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 10,
+              "kind": "point_on",
+              "refs": [
+                [
+                  16,
+                  "p1"
+                ],
+                [
+                  11,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 11,
+              "kind": "coincident",
+              "refs": [
+                [
+                  17,
+                  "p0"
+                ],
+                [
+                  16,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 12,
+              "kind": "coincident",
+              "refs": [
+                [
+                  17,
+                  "p1"
+                ],
+                [
+                  15,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 13,
+              "kind": "coincident",
+              "refs": [
+                [
+                  18,
+                  "p0"
+                ],
+                [
+                  15,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 14,
+              "kind": "coincident",
+              "refs": [
+                [
+                  18,
+                  "p1"
+                ],
+                [
+                  15,
+                  "p0"
+                ]
+              ]
+            }
+          ]
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

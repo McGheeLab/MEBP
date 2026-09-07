@@ -269,8 +269,13 @@ class DeviceProfile:
         # global default. None ⇒ leave the global setting untouched (inherit).
         if self.xy_controller_json is not None:
             settings.set("controller.controller_json", self.xy_controller_json)
-        if self.xy_max_speed_um_s is not None:
-            settings.set("device_profile.xy_max_speed_um_s", self.xy_max_speed_um_s)
+        # v7.21.2: an UNDECLARED profile must CLEAR the key, not skip it. Skipping
+        # meant loading a profile with no declared top speed silently inherited
+        # whatever the previously-loaded machine declared — a physical claim about
+        # one stage carried onto another, with only a log line to say so.
+        settings.set("device_profile.xy_max_speed_um_s", self.xy_max_speed_um_s)
+        if self.xy_max_speed_um_s is None:
+            settings.set("device_profile.xy_max_speed_source", None)
         if self.z_up_sign is not None:
             settings.set("device_profile.z_up_sign", self.z_up_sign)
         if self.plate_flip_180 is not None:

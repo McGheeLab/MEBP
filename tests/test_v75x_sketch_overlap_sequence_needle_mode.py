@@ -256,16 +256,23 @@ class TestReviewFixes(unittest.TestCase):
                 if p["type"] == "section"]
         self.assertEqual(len(secs), 1)
 
-    def test_plan_uses_last_pass_end_for_thick_outline(self):
-        # Finding 3: a thick outline's exit is its LAST (outer) pass end, so a
-        # shape at the outer edge welds in the plan (not the inner-pass end).
-        thick = SketchShape(kind="circle", cx=0, cy=0, radius=5.0,
-                            line_width_mm=1.2)   # passes at r=4.6/5.0/5.4
-        at_outer = _line(5.4, 0.0, 5.4, 5.0, 0)
-        secs = [p for p in plan_print_sections(
-            Sketch(shapes=[thick, at_outer], line_spacing_mm=0.4), None)
-            if p["type"] == "section"]
-        self.assertEqual(len(secs), 1)          # line welds to the outer pass
+    def test_plan_uses_the_drawn_radius_not_an_offset_pass(self):
+        """v7.21.4 — REPLACES ``test_plan_uses_last_pass_end_for_thick_outline``.
+
+        A 1.2 mm-wide circle used to print as concentric passes at r=4.6/5.0/5.4,
+        so a line touching r=5.4 welded to the outer pass. Now the outline is a
+        single pass on the DRAWN radius: the r=5.0 line welds and the r=5.4 one
+        (which no longer has a pass to touch) does not — i.e. a declared width
+        never moves the printed geometry off what was sketched.
+        """
+        def _secs(line):
+            thick = SketchShape(kind="circle", cx=0, cy=0, radius=5.0,
+                                line_width_mm=1.2)
+            return [p for p in plan_print_sections(
+                Sketch(shapes=[thick, line], line_spacing_mm=0.4), None)
+                if p["type"] == "section"]
+        self.assertEqual(len(_secs(_line(5.0, 0.0, 5.0, 5.0, 0))), 1)
+        self.assertEqual(len(_secs(_line(5.4, 0.0, 5.4, 5.0, 0))), 2)
 
     def test_plan_mirrors_overlap_extended_exit(self):
         # Finding 2: a shape sitting at a closed loop's over-closure end welds in

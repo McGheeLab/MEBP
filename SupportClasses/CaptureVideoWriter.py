@@ -49,6 +49,43 @@ FOURCC_CHAIN: dict = {
 # A file smaller than this at finalize never contained real video.
 MIN_USABLE_BYTES = 1024
 
+# v7.21.8 — STRUCTURAL size ceiling per container, in bytes. 0 = none known.
+#
+# AVI is RIFF, whose chunk offsets are 32-bit: 4 GB is the absolute ceiling and
+# the practical one is lower (the OpenCV AVI muxer is widely reported to produce
+# files that stop being seekable/playable around 2 GB). This mattered not at all
+# while recordings were capped at 10 minutes — no realistic setting got near it.
+# With the time cap gone it is reachable, so a long AVI is stopped CLEANLY at a
+# size the container can still describe, instead of running on into a file that
+# looks finished and will not play. mp4 has no comparable limit.
+#
+# This is a floor on trust, not a preference: it only ever LOWERS the operator's
+# configured size cap, and only for AVI.
+CONTAINER_MAX_BYTES: dict = {
+    "avi": 2 * 1024 ** 3,
+    "mp4": 0,
+}
+
+
+def container_byte_limit(container: str, configured_bytes: float) -> float:
+    """The size limit actually enforced for ``container``.
+
+    ``configured_bytes`` is the operator's ``video_max_gb`` in bytes (0 = no
+    limit). Returns whichever is smaller and non-zero, so:
+
+      * mp4 → exactly what the operator asked for;
+      * avi → their value, or the structural ceiling if theirs is larger or
+        unlimited.
+    """
+    structural = float(CONTAINER_MAX_BYTES.get(
+        str(container or "").strip().lower(), 0) or 0)
+    configured = max(0.0, float(configured_bytes or 0))
+    if structural <= 0:
+        return configured
+    if configured <= 0:
+        return structural
+    return min(configured, structural)
+
 
 @dataclass
 class VideoResult:

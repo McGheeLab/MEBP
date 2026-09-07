@@ -170,6 +170,7 @@ class SketchPage(QWidget):
         self._canvas.sketch_changed.connect(self._on_sketch_changed)
         self._canvas.selection_changed.connect(self._on_selection_changed)
         self._canvas.fill_result.connect(self._on_fill_result)
+        self._canvas.join_result.connect(self._on_join_result)
         self._canvas.constraints_changed.connect(self._refresh_constraints_card)
 
         # v7.5.x: centre pane = XY drawing canvas (top) over an XZ side-profile
@@ -856,6 +857,37 @@ class SketchPage(QWidget):
         title.clicked.connect(
             lambda _=False, ii=idxs: self._canvas.select_indices(ii))
         header.addWidget(title, 1)
+
+        # v7.21.4 — turn this whole section into a move-only (no-extrude) pass.
+        # Checked only when EVERY shape in it is already move-only, so a mixed
+        # section reads as "printing" and one click makes all of it move-only.
+        shapes_all = self._canvas.sketch().shapes
+        sec_idxs = [i for i in idxs
+                    if 0 <= i < len(shapes_all)
+                    and shapes_all[i].kind != "travel"]
+        all_off = bool(sec_idxs) and all(
+            getattr(shapes_all[i], "no_print", False) for i in sec_idxs)
+        ne = QToolButton()
+        ne.setText("no extrude" if all_off else "extruding")
+        ne.setCheckable(True)
+        ne.setChecked(all_off)
+        ne.setAutoRaise(True)
+        ne.setCursor(Qt.PointingHandCursor)
+        ne.setEnabled(bool(sec_idxs))
+        ne.setToolTip(
+            "Toggle EXTRUSION for this whole section. Off: the needle still "
+            "follows the same path, welded to its neighbours, but the pump "
+            "does not advance — a repositioning move instead of a bead.")
+        ne.setStyleSheet(
+            f"QToolButton {{ font-size: {_sf(8)}pt; padding: {s(1)}px "
+            f"{s(4)}px; border-radius: {s(3)}px; color: "
+            f"{COLORS['subtext0']}; }} "
+            f"QToolButton:checked {{ color: {COLORS.get('yellow', '#f9e2af')}; "
+            f"background: {COLORS['surface1']}; }}")
+        ne.clicked.connect(
+            lambda _=False, ii=list(sec_idxs), b=ne:
+            self._set_section_no_print(ii, b.isChecked()))
+        header.addWidget(ne)
         outer.addLayout(header)
 
         body = QWidget()
@@ -866,7 +898,9 @@ class SketchPage(QWidget):
         for si in idxs:
             if 0 <= si < len(shapes):
                 sh = shapes[si]
-                op = QLabel(f"▪ {sh.kind} #{si}")
+                tag = ("  · no extrude"
+                       if getattr(sh, "no_print", False) else "")
+                op = QLabel(f"▪ {sh.kind} #{si}{tag}")
                 op.setStyleSheet(
                     f"color: {COLORS['subtext0']}; font-size: {_sf(8)}pt;")
                 body_lay.addWidget(op)
@@ -882,6 +916,15 @@ class SketchPage(QWidget):
             chev.setText("▸" if now else "▾")
         chev.clicked.connect(_toggle)
         return box
+
+    def _set_section_no_print(self, indices, value: bool):
+        """Make an entire print section move-only (or printing again)."""
+        if self._canvas.set_no_print(indices, value):
+            self._schedule_preview()
+            self._refresh_sequence()
+            self._rebuild_props()
+        else:
+            self._refresh_sequence()        # re-sync the toggle's own state
 
     def _seq_break_row(self, reason: str) -> QLabel:
         txt = {
@@ -1032,11 +1075,106 @@ class SketchPage(QWidget):
         apply.clicked.connect(lambda: self._apply_group_scale(scale))
         lay.addWidget(apply)
 
+        # v7.21.4 — no-extrude across the whole selection (a section's shapes
+        # are selected together from the Print-sequence card, so this is how a
+        # SECTION is turned into a move-only pass).
+        shapes = self._canvas.sketch().shapes
+        sel = [i for i in self._canvas.selected_indices()
+               if 0 <= i < len(shapes) and shapes[i].kind != "travel"]
+        all_off = bool(sel) and all(
+            getattr(shapes[i], "no_print", False) for i in sel)
+        np_chk = QCheckBox("No extrude (move only — deposits nothing)")
+        np_chk.setChecked(all_off)
+        np_chk.setEnabled(bool(sel))
+        np_chk.setToolTip(
+            "Applies to every selected shape: the needle follows their paths "
+            "without the pump advancing.")
+        np_chk.toggled.connect(lambda v: self._set_no_print_selected(v))
+        lay.addWidget(np_chk)
+
         delete = QPushButton("Delete selection")
         delete.setObjectName("dangerBtn")
         delete.clicked.connect(self._canvas_delete)
         lay.addWidget(delete)
         return grp
+
+    def _set_no_print_selected(self, value: bool):
+        """Mark every selected shape move-only / printing again (undoable)."""
+        if self._building:
+            return
+        if self._canvas.set_no_print(self._canvas.selected_indices(), value):
+            self._schedule_preview()
+            self._refresh_sequence()
+            self._rebuild_props()
+
+    def _build_width_match_row(self, lay, sh):
+        """State what this shape's declared width actually DEPOSITS.
+
+        v7.21.4 made an outline a single pass, so the width has to come from
+        flow. v7.21.5 makes that automatic: with **Line widths set extrusion**
+        on (the Print-parameters card), each shape's declared width IS its own
+        extrusion modifier, the per-segment profile ships with the baked print,
+        and Quick Print deposits it — so this row reports the resolved modifier
+        rather than offering to move one sketch-wide number to match one shape.
+        With the switch off it falls back to naming the × this width would need.
+        """
+        sk = self._canvas.sketch()
+        ref = self._bead_ref_mm()
+        cur = float(sk.extrusion_multiplier)
+        lab = QLabel()
+        lab.setWordWrap(True)
+        lab.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {_sf(8)}pt;")
+        if ref <= 0:
+            lab.setText("One pass is printed at this line. Configure a needle "
+                        "to price the extrusion this width needs.")
+            lay.addWidget(lab)
+            return
+        need = float(sh.line_width_mm) / ref
+        if bool(getattr(sk, "width_drives_extrusion", False)):
+            if getattr(sh, "no_print", False):
+                lab.setText("This shape is set to NO EXTRUDE — it deposits "
+                            "nothing whatever width is declared.")
+            else:
+                lab.setText(
+                    f"One pass at this width → extrusion ×{need * cur:.2f} "
+                    f"(width {sh.line_width_mm:.3f} mm ÷ 1× bead {ref:.3f} mm "
+                    f"× the sketch trim ×{cur:g}). This is what the baked "
+                    f"print sends to Quick Print for these segments.")
+            lay.addWidget(lab)
+            return
+        ok = abs(cur * ref - float(sh.line_width_mm)) <= 0.01
+        lab.setText(
+            f"One pass is printed at this line — width comes from flow. "
+            f"{cur:.2f}× deposits ≈ {cur * ref:.3f} mm; this width needs "
+            f"{need:.2f}×." + ("  ✓ matched" if ok else ""))
+        lay.addWidget(lab)
+        btn = QPushButton(f"Set extrusion to {need:.2f}× to match")
+        btn.setEnabled(not ok and 0.05 <= need <= 5.0)
+        btn.setToolTip(
+            "Sets the sketch-wide extrusion multiplier so one bead is as wide "
+            "as this shape's line width. The multiplier is shared by the whole "
+            "sketch, so shapes with different line widths cannot all match at "
+            "once — turn on 'Line widths set extrusion' for that."
+            if not ok else "Already matched.")
+        btn.clicked.connect(lambda: self._match_extrusion_to(need))
+        lay.addWidget(btn)
+
+    def _match_extrusion_to(self, need: float):
+        need = max(0.05, min(5.0, float(need)))
+        self._canvas.sketch().extrusion_multiplier = need
+        self._apply_bead_width()
+        self._canvas.update()
+        self._schedule_preview()
+        self._rebuild_props()               # refresh the card + the print card
+
+    def _on_width_drives_extrusion(self, on: bool):
+        """Toggle per-shape width→extrusion for the whole sketch."""
+        if self._building:
+            return
+        self._canvas.sketch().width_drives_extrusion = bool(on)
+        self._canvas.update()
+        self._schedule_preview()
+        self._rebuild_props()
 
     def _apply_group_scale(self, spin):
         self._canvas.scale_selection(float(spin.value()))
@@ -1145,10 +1283,33 @@ class SketchPage(QWidget):
             fill.toggled.connect(lambda v: self._set(sh, "filled", v))
             lay.addWidget(fill)
 
-        # Printed bead width (thicker = more passes + more volume)
+        # Printed bead width — the TARGET width of this line. v7.21.4: the
+        # compiler lays exactly ONE pass on the drawn geometry and never fills
+        # this width with adjacent parallel lines; the width is reached by
+        # flow, i.e. by raising the extrusion multiplier below.
         lw = self._dspin(sh.line_width_mm, 0.05, 50, 0.1)
+        lw.setToolTip(
+            "Target width of the printed bead. "
+            "One pass is printed on the line you drew — the software never "
+            "adds extra parallel lines to fill this width. Reach it by "
+            "raising the extrusion multiplier (Print settings), which the "
+            "button below sets for you.")
         lw.valueChanged.connect(lambda v: self._set(sh, "line_width_mm", v))
         self._field_row(lay, "Line width", lw)
+        self._build_width_match_row(lay, sh)
+
+        # No-extrude (move only): the needle follows this path without
+        # depositing. v7.21.4 — operator asked for it per section.
+        if sh.kind != "travel":
+            np_chk = QCheckBox("No extrude (move only — deposits nothing)")
+            np_chk.setChecked(bool(getattr(sh, "no_print", False)))
+            np_chk.setToolTip(
+                "On: the needle still follows this path, welded to its "
+                "neighbours, but the pump does not advance — a repositioning "
+                "move rather than a printed bead. The preview draws it as a "
+                "dashed travel run.")
+            np_chk.toggled.connect(lambda v: self._set_no_print_selected(v))
+            lay.addWidget(np_chk)
 
         # Ink assignment (abstract — the physical pump is chosen later, at
         # print time, in Quick Print's ink-mapping step).
@@ -1170,8 +1331,9 @@ class SketchPage(QWidget):
             lay.addWidget(start_lbl)
             start_hint = QLabel(
                 "Drag the green ▸ marker on the canvas to set where this shape "
-                "starts printing — it snaps to existing lines, so it can begin "
-                "exactly where the previous shape ended (no pen-up between them).")
+                "starts printing — it snaps to existing lines AND to other "
+                "objects' print start / stop markers, so it can begin exactly "
+                "where another shape ends (no pen-up between them).")
             start_hint.setWordWrap(True)
             start_hint.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: {_sf(8)}pt;")
@@ -1353,6 +1515,9 @@ class SketchPage(QWidget):
         # v7.5.x: extrusion multiplier — scales the shaded thickness band on the
         # canvas AND the deposited volume of the baked print. 1× ≈ a bead the
         # needle inner Ø wide; smaller = thinner, larger = thicker.
+        # v7.21.4: this is now the ONLY way a line gets wider — the compiler
+        # never fills a declared line width with adjacent parallel passes. A
+        # shape's card reports the × its width needs and can set it here.
         em = self._dspin(sk.extrusion_multiplier, 0.05, 5.0, 0.1, "×")
         em.setToolTip(
             "Extrusion multiplier — how much material is laid per mm.\n"
@@ -1361,6 +1526,24 @@ class SketchPage(QWidget):
             "volume of the baked print.")
         em.valueChanged.connect(self._on_extrusion_changed)
         self._field_row(lay, "Extrusion", em)
+
+        # v7.21.5 — each shape's declared line width becomes its OWN extrusion
+        # modifier, and the resulting per-segment profile is baked into the
+        # print so Quick Print deposits it. Off for a sketch saved before this
+        # existed (its widths were never an extrusion instruction).
+        wd = QCheckBox("Line widths set extrusion (per shape)")
+        wd.setChecked(bool(getattr(sk, "width_drives_extrusion", False)))
+        wd.setToolTip(
+            "On: a shape declaring a 0.8 mm line on a 0.4 mm bead prints at "
+            "×2 while its neighbours print at their own widths, and the "
+            "per-segment extrusion travels with the baked print into Quick "
+            "Print. The Extrusion × above becomes a trim on all of it. "
+            "Off: one extrusion for the whole sketch (pre-v7.21.5). Turning "
+            "this ON for an older sketch can change how much it deposits — "
+            "check the volume below.")
+        wd.toggled.connect(self._on_width_drives_extrusion)
+        lay.addWidget(wd)
+
         self._bead_info_lbl = QLabel(self._bead_info_text())
         self._bead_info_lbl.setWordWrap(True)
         self._bead_info_lbl.setStyleSheet(
@@ -1517,7 +1700,9 @@ class SketchPage(QWidget):
             return "Configure a needle to size the bead from its inner Ø."
         src = "needle inner Ø" if self._needle_id_mm > 0 else "fill pitch"
         return (f"Shaded bead ≈ {ref * mult:.3f} mm at {mult:.2f}× "
-                f"(1× = {src} {ref:.3f} mm)")
+                f"(1× = {src} {ref:.3f} mm). Every outline prints as ONE pass, "
+                f"so this is how a line reaches its width — the software never "
+                f"adds parallel lines to fill it.")
 
     @staticmethod
     def _shape_is_closed_loop(sh: SketchShape) -> bool:
@@ -1636,6 +1821,12 @@ class SketchPage(QWidget):
         self._rebuild_props()
         self._refresh_constraint_buttons()
 
+    def _on_join_result(self, msg: str):
+        """A drawn line was joined to an existing object's print start/stop."""
+        self._status_lbl.setText(f"✓ {msg}")
+        self._status_lbl.setStyleSheet(
+            f"color: {COLORS['green']}; font-size: {_sf(9)}pt;")
+
     def _on_fill_result(self, ok: bool):
         if ok:
             self._status_lbl.setText("✓ Region filled")
@@ -1749,12 +1940,31 @@ class SketchPage(QWidget):
                 logger.debug(f"sketch Z→zero-ref bake skipped: {e}")
                 traj = result.trajectory
 
+        # v7.21.5 — THE EXTRUSION ALONG THE PATH ships with the print, so
+        # Quick Print prints what this sketch computed instead of re-deriving a
+        # single flow for the whole path. One entry per SEGMENT of the baked
+        # trajectory (0.0 = travel or a no-extrude shape).
+        #
+        # Both forms are recorded on purpose: the MODIFIER is what the operator
+        # set and reads (bore-relative), while µL/mm is the absolute quantity a
+        # pump delivers. A consumer recomputes µL/mm from the modifier against
+        # the needle FITTED NOW — so the declared widths print — and can compare
+        # against the stored µL/mm to see whether the needle changed since the
+        # bake. ``extrusion_ref_width_mm`` is the width a 1.0× bead is, i.e.
+        # what the modifier is measured against.
+        prof = [round(float(v), 6) for v in (result.extrusion_profile or [])]
+        vpm = [round(float(v), 9) for v in (result.vol_per_mm_profile or [])]
         extra_params = {
             "z_above_plate_bottom_mm": float(sk.z_start_mm),
             "z_datum": "plate_bottom",
             "layer_height_mm": float(sk.layer_height_mm),
             "num_layers": int(sk.num_layers),
             "extrusion_multiplier": float(sk.extrusion_multiplier),
+            "width_drives_extrusion": bool(sk.width_drives_extrusion),
+            "extrusion_profile": prof,
+            "vol_per_mm_profile": vpm,
+            "extrusion_ref_width_mm": float(result.extrusion_ref_width_mm),
+            "extrusion_total_uL": float(result.total_volume_uL),
             # The vector Sketch itself — lets the Library "Edit in Sketch"
             # reload the exact shapes instead of the baked toolpath.
             "sketch": sk.to_dict(),
@@ -2023,7 +2233,6 @@ class SketchPage(QWidget):
         if od and od > 0:
             self._needle_od_mm = float(od)
             self._canvas.sketch().line_spacing_mm = float(od)
-            self._canvas.set_default_line_width(float(od))
         # Feed the orifice outer Ø so a "needle Ø" closure-overlap marker
         # matches what the compiler extrudes.
         self._canvas.set_needle_od(self._needle_od_mm)
@@ -2032,6 +2241,15 @@ class SketchPage(QWidget):
         # multiplier.
         idv = (needle_orifice_id_um(self._needle) / 1000.0) if self._needle else 0.0
         self._needle_id_mm = float(idv) if idv and idv > 0 else 0.0
+        # v7.21.5: a new shape's declared line width seeds at the 1x REFERENCE
+        # (the orifice INNER diameter — the same reference the shaded band and
+        # the "needs Nx" readout use), NOT the outer diameter as before. Now
+        # that a declared width drives that shape's extrusion, seeding it at the
+        # outer diameter would make every freshly drawn shape od/id (~1.7x on a
+        # hypodermic needle) over-extruded the moment it was drawn.
+        seed_lw = self._needle_id_mm or self._needle_od_mm
+        if seed_lw > 0:
+            self._canvas.set_default_line_width(float(seed_lw))
         self._apply_bead_width()
 
         # Load the active plate and (re)populate the well selector.

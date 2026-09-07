@@ -1168,6 +1168,23 @@ class QuickPrintWorkflowPage(QWidget):
             "page — one value used everywhere).")
         sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
                        0.0, common_key="pump_settle_time_s", overridable=False)
+        # v7.21.7: hold the needle in the liquid after a reagent aspirate. A
+        # SEPARATE knob from the settle dwell above, because they cover different
+        # halves of the same move: the settle dwell brackets a pump move that
+        # already blocks until the PLUNGER has drained from Marlin's planner,
+        # while this one covers the FLUID still being drawn in afterwards through
+        # a compliant column. Lift Z inside that window and the tail of the
+        # aspirate is air.
+        self._g_hold_liquid = self._dspin(0.0, 120.0, 2.0, " s", 2, 0.5)
+        self._g_hold_liquid.setToolTip(
+            "Extra time the needle stays IN THE LIQUID after a reagent aspirate "
+            "(ink / oil / buffer) finishes, before Z retracts and the stage "
+            "travels on. Raise it if a pickup ends with air drawn into the "
+            "needle; 0 = no extra hold.")
+        sec.add_common("g_hold_liquid", "Hold in liquid after aspirating",
+                       self._g_hold_liquid, 2.0,
+                       common_key="pump_post_aspirate_dwell_s",
+                       overridable=False)
 
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
@@ -2116,6 +2133,41 @@ class QuickPrintWorkflowPage(QWidget):
             return None
         return arr
 
+    # ══ v7.21.5: the sketch's own extrusion, along the path ══════════
+    #
+    # A Print-Builder sketch bakes ``extrusion_profile`` — one extrusion
+    # MODIFIER per trajectory segment (0.0 = travel or a no-extrude shape) —
+    # plus the reference bead width it was measured against. Quick Print used
+    # to discard it and re-derive ONE flow for the whole path from its own
+    # knobs, so a sketch whose shapes declare different line widths printed
+    # them all at the same width. Now the profile rides through to the
+    # executor, and Quick Print's own Extrusion × becomes a TRIM on top of it.
+
+    @staticmethod
+    def _obj_dict_extrusion_modifiers(obj_dict, n_segments: int):
+        """The baked per-segment extrusion modifiers for one object, or None.
+
+        REFUSES a profile whose length does not match the object's own
+        trajectory (``n_segments``): an off-by-one profile would apply a
+        shape's flow to the wrong part of the path — worse than falling back
+        to a single flow, which is merely the previous behaviour.
+        """
+        params = (obj_dict or {}).get("params", {}) or {}
+        raw = params.get("extrusion_profile")
+        if not raw or n_segments <= 0:
+            return None
+        try:
+            vals = [max(0.0, float(v)) for v in raw]
+        except (TypeError, ValueError):
+            logger.warning("extrusion_profile is not numeric — ignoring it")
+            return None
+        if len(vals) != n_segments:
+            logger.warning(
+                "extrusion_profile has %d entries for %d segments — ignoring "
+                "it and using a single flow", len(vals), n_segments)
+            return None
+        return vals
+
     def _obj_dict_to_path_points(self, obj_dict, needle, syringe_map):
         """Convert one object dict → flat list[(x_mm, y_mm)] (well-relative).
 
@@ -2202,32 +2254,57 @@ class QuickPrintWorkflowPage(QWidget):
         path.
         """
         arr = self._obj_dict_to_trajectory(obj_dict, needle, syringe_map)
-        return self._subpaths_from_array(arr)
+        n_seg = (arr.shape[0] - 1) if arr is not None and len(arr) else 0
+        return self._subpaths_from_array(
+            arr, self._obj_dict_extrusion_modifiers(obj_dict, n_seg))
 
-    def _subpaths_from_array(self, arr):
+    def _subpaths_from_array(self, arr, modifiers=None):
         """Split an Nx7 trajectory into print sub-paths ``[[(x,y)…], …]`` at its
         internal travel moves (shared by the object path and the per-ink-group
-        multi-ink path). A path with no travel info yields one sub-path."""
+        multi-ink path). A path with no travel info yields one sub-path.
+
+        v7.21.5: when ``modifiers`` (one extrusion modifier per trajectory
+        SEGMENT) is given, it is sliced in LOCKSTEP with the same split and
+        recorded on :attr:`_last_subpath_modifiers` — one list per returned
+        sub-path, each with ``len(sub) - 1`` entries. Kept as a side channel
+        rather than a changed return type because ``_path_segments_for_selection``
+        has a dozen callers that want plain XY.
+        """
+        self._last_subpath_modifiers = []
         if arr is None:
             return []
         pts = [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
+        mods = list(modifiers) if modifiers is not None else None
+        if mods is not None and len(mods) != max(0, len(pts) - 1):
+            mods = None                     # refuse a mismatched profile
         mask = self._travel_mask(arr)
         if mask is None:
-            return [pts] if len(pts) >= 2 else []
+            if len(pts) < 2:
+                return []
+            self._last_subpath_modifiers = [list(mods)] if mods is not None else [None]
+            return [pts]
 
         subpaths: list[list[tuple[float, float]]] = []
+        sub_mods: list = []
         cur: list[tuple[float, float]] = [pts[0]]
+        cur_mods: list[float] = []
         for i in range(len(pts) - 1):
             if bool(mask[i]):
                 # Segment i→i+1 is travel: close the current print run and
                 # restart at the travel destination (drop the travel hop).
                 if len(cur) >= 2:
                     subpaths.append(cur)
+                    sub_mods.append(cur_mods if mods is not None else None)
                 cur = [pts[i + 1]]
+                cur_mods = []
             else:
                 cur.append(pts[i + 1])
+                if mods is not None:
+                    cur_mods.append(mods[i])
         if len(cur) >= 2:
             subpaths.append(cur)
+            sub_mods.append(cur_mods if mods is not None else None)
+        self._last_subpath_modifiers = sub_mods
         return subpaths
 
     def _path_segments_for_selection(self) -> list[list[tuple[float, float]]]:
@@ -2276,11 +2353,63 @@ class QuickPrintWorkflowPage(QWidget):
                     obj_dicts.append(od)
 
         segments: list[list[tuple[float, float]]] = []
+        profiles: list = []
         for od in obj_dicts:
-            for sub in self._obj_dict_to_subpaths(od, needle, syringe_map):
+            subs = self._obj_dict_to_subpaths(od, needle, syringe_map)
+            mods = list(getattr(self, "_last_subpath_modifiers", []) or [])
+            for k, sub in enumerate(subs):
                 if sub and len(sub) >= 2:
                     segments.append(sub)
+                    profiles.append(mods[k] if k < len(mods) else None)
+        # v7.21.5: kept beside the segments (same order, same length) so the job
+        # builder can hand each PRINT_PATH its own deposition without changing
+        # this method's return type — a dozen callers want plain XY.
+        self._last_segment_modifiers = profiles
         return segments
+
+    def _segments_and_modifiers_for_selection(self):
+        """``(segments, modifier_profiles)`` for the selected object.
+
+        ``modifier_profiles[k]`` is either None (no baked profile — use one
+        flow) or a list of ``len(segments[k]) - 1`` extrusion modifiers.
+        """
+        segs = self._path_segments_for_selection()
+        mods = list(getattr(self, "_last_segment_modifiers", []) or [])
+        while len(mods) < len(segs):
+            mods.append(None)
+        return segs, mods[:len(segs)]
+
+    def _vol_per_mm_profiles(self, modifier_profiles):
+        """Convert per-segment MODIFIERS → µL/mm, against the needle fitted NOW.
+
+        Recomputing from the modifier (rather than replaying the sketch's own
+        µL/mm) prints the DECLARED WIDTHS with the current needle instead of
+        reproducing a volume that was only right for the needle present at bake
+        time. Quick Print's own Extrusion × rides on top as a trim, so the
+        operator keeps one knob over a sketch's numbers. Returns a list the same
+        length as the input, with None where there was no profile.
+        """
+        from SupportClasses.ExtrusionProfile import modifier_to_vol_per_mm
+        area = self._needle_cross_section_mm2()
+        trim = self._extrusion_modifier()
+        out = []
+        for mods in modifier_profiles or []:
+            if not mods or area <= 0:
+                out.append(None)
+            else:
+                out.append(modifier_to_vol_per_mm(mods, area, trim))
+        return out
+
+    def _extrusion_profile_summary(self):
+        """``(has_profile, min_mod, max_mod)`` over the PRINTING segments of the
+        selected object — what the setup status reports and what bounds the
+        flow ceiling. Zeros are skipped: a travel/no-extrude segment is an
+        absence of deposition, not a thin bead."""
+        _segs, mods = self._segments_and_modifiers_for_selection()
+        vals = [v for prof in mods if prof for v in prof if v > 0.0]
+        if not vals:
+            return False, 0.0, 0.0
+        return True, min(vals), max(vals)
 
     def _path_points_for_selection(self) -> list[tuple[float, float]]:
         """Flattened path (all objects concatenated) — kept for geometry
@@ -3221,12 +3350,31 @@ class QuickPrintWorkflowPage(QWidget):
         xy = self._xy_max_mm_s()
         maxflow = self._max_pump_flow_uL_s()
         area = self._needle_cross_section_mm2()
-        mod = self._extrusion_modifier()
+        # v7.21.5: with a per-segment profile the flow is NOT uniform, so the
+        # ceiling has to be sized by the THICKEST segment — the peak is what
+        # would over-pressure the needle (a pulled glass tip shatters), and a
+        # mean would let it through. ``_flow_modifier_peak`` is the trim alone
+        # when there is no profile, so an ordinary print is unchanged.
+        mod = self._flow_modifier_peak()
         if maxflow > 0 and area > 0 and mod > 0:
             xy_flow = maxflow / (area * mod)
             if xy_flow < xy:
                 return xy_flow
         return xy
+
+    def _flow_modifier_peak(self) -> float:
+        """The largest effective extrusion modifier the selected print uses.
+
+        ``Extrusion ×`` (the trim) alone when the object carries no baked
+        profile — so behaviour is unchanged for every non-sketch print — and
+        ``trim × peak(profile)`` when it does. Read from a cache refreshed in
+        :meth:`_refresh_setup_status` (and on every object change), because the
+        flow ceiling is consulted from the status refresh and re-deriving the
+        geometry there would load the print file again on each pass.
+        """
+        trim = self._extrusion_modifier()
+        peak = getattr(self, "_ext_profile_peak", 0.0) or 0.0
+        return trim * peak if peak > 0 else trim
 
     def _auto_flow_100_uL_s(self) -> float:
         """Auto-calculated pump flow at 100% print speed (µL/s).
@@ -3390,6 +3538,29 @@ class QuickPrintWorkflowPage(QWidget):
         except Exception:
             pass
         return warn
+
+    def refresh_speed_limits(self) -> None:
+        """v7.21.2: re-read everything the XY calibration just changed.
+
+        Called by ``MainWindow._refresh_all_speed_limits`` (via
+        ``StageController.notify_speed_limits_changed``) the moment a calibration
+        commits, so Quick Print picks the new tuning up WITHOUT a restart: the
+        top-speed cap re-anchors to the measured maximum and the "stage motion not
+        characterised" warning clears.
+
+        The tuning itself needs no refresh — ``_build_settings`` calls
+        ``stamp_print_settings(settings, get_store())`` on every print, so the next
+        print reads the freshly persisted values straight out of the per-machine
+        store. This method only re-syncs what is DISPLAYED.
+        """
+        try:
+            self._update_top_speed_cap()
+        except Exception as e:
+            logger.debug("quick print top-speed cap refresh failed: %s", e)
+        try:
+            self._refresh_setup_status()
+        except Exception as e:
+            logger.debug("quick print status refresh failed: %s", e)
 
     def _update_top_speed_cap(self) -> None:
         """Cap the top-speed spin at the MEASURED stage maximum (only when a
@@ -3596,6 +3767,16 @@ class QuickPrintWorkflowPage(QWidget):
 
         # ── geometry ──
         segs = _try(self._path_segments_for_selection, []) or []
+        # v7.21.5: refresh the extrusion-profile cache from the SAME geometry
+        # pass (the modifiers are recorded beside the segments), so the flow
+        # ceiling and the status text agree and neither re-reads the print file.
+        try:
+            has_prof, lo_mod, hi_mod = self._extrusion_profile_summary()
+            self._ext_profile_peak = hi_mod if has_prof else 0.0
+            self._ext_profile_span = (lo_mod, hi_mod) if has_prof else None
+        except Exception:
+            self._ext_profile_peak = 0.0
+            self._ext_profile_span = None
         ctx.n_strokes = len(segs) or None
         length = 0.0
         rmax = 0.0
@@ -3622,6 +3803,14 @@ class QuickPrintWorkflowPage(QWidget):
         ctx.bore_id_um = _try(lambda: float(needle.id_um), None) if needle else None
         area = _try(self._needle_cross_section_mm2, 0.0) or 0.0
         mod = _try(self._extrusion_modifier, 1.0) or 1.0
+        span = getattr(self, "_ext_profile_span", None)
+        if span:
+            # The bead is no longer ONE width: report the effective range and
+            # that the × is now a trim, and size the bead readout from the
+            # WIDEST segment (the one that has to fit the flow ceiling).
+            ctx.extrusion_span = (span[0] * mod, span[1] * mod)
+            ctx.extrusion_trim = mod
+            mod = span[1] * mod
         if area > 0:
             # An area-equivalent circular bead: Ø = 2·sqrt(A·mod/π).
             ctx.bead_width_um = 2.0 * ((area * mod / 3.141592653589793) ** 0.5) * 1000.0
@@ -4512,11 +4701,14 @@ class QuickPrintWorkflowPage(QWidget):
         from SupportClasses.SketchTrajectory import compile_to_trajectory
         needle, syringe_map = self._needle_and_syringe()
         try:
-            arr = compile_to_trajectory(
-                sub, needle, syringe_map.get(pump)).trajectory
+            res = compile_to_trajectory(sub, needle, syringe_map.get(pump))
         except Exception:
             return []
-        return self._subpaths_from_array(arr)
+        # v7.21.5: the sub-sketch is compiled RIGHT HERE, so its per-segment
+        # extrusion is in hand — a multi-ink run gets the same fidelity as a
+        # single-ink one instead of falling back to one flow per group.
+        return self._subpaths_from_array(
+            res.trajectory, res.extrusion_profile or None)
 
     def _pickup_uL_for_length(self, path_len_mm: float) -> float:
         speed, flow, prime = self._resolved_print_kinematics()
@@ -4551,6 +4743,20 @@ class QuickPrintWorkflowPage(QWidget):
                if getattr(self, "_orbit_speed_spin", None) is not None else 2.0)
         return {"prime_uL": prime_uL, "orbit": orbit,
                 "orbit_diameter_mm": dia, "orbit_speed_mm_s": spd}
+
+    def _hold_in_liquid_s(self) -> float:
+        """v7.21.7: the global hold-in-liquid dwell (s) in force, for the
+        confirm dialogs and the settings summary. Read from the SAME place the
+        executor resolves it (the controller, which reads HardwareConfig), so
+        the dialog cannot quote a value the run will not use."""
+        ctrl = getattr(self, "_controller", None)
+        getter = getattr(ctrl, "pump_post_aspirate_dwell_s", None)
+        if not callable(getter):
+            return 0.0
+        try:
+            return max(0.0, float(getter()))
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _segments_length_mm(segments) -> float:
@@ -4621,6 +4827,7 @@ class QuickPrintWorkflowPage(QWidget):
             wn = resolve_pickup_well(wl, self._plate)
             ink_pos = wells.get(wn) if wn else None
             segments = self._group_segments(sub, pump)
+            group_mods = list(getattr(self, "_last_subpath_modifiers", []) or [])
             if not segments or ink_pos is None:
                 continue
             length = self._segments_length_mm(segments)
@@ -4628,6 +4835,7 @@ class QuickPrintWorkflowPage(QWidget):
                 "ink_id": iid, "ink_name": ink_name, "pump": pump,
                 "ink_pos": ink_pos, "ink_dip_z": ink_dip_z,
                 "segments": segments, "well": well, "center": center,
+                "extrusion_profiles": self._vol_per_mm_profiles(group_mods),
                 "settings": self._build_settings(pump=pump),
                 "pickup_uL": self._pickup_uL_for_length(length),
                 # Resolve prime/orbit kwargs on the GUI thread (reads widgets).
@@ -4663,6 +4871,11 @@ class QuickPrintWorkflowPage(QWidget):
                 f"  • Circular pickup ({self._orbit_dia_spin.value():.2f} mm) "
                 + ("for all inks" if self._orbit_all_check.isChecked()
                    else "for granular inks"))
+        hold_s = self._hold_in_liquid_s()
+        if hold_s > 0:
+            lines.append(
+                f"  • Hold the needle in the liquid {hold_s:.1f}s after every "
+                "aspirate before lifting")
         if cleanup:
             lines.append("  • Clean the needle at the end")
         lines += ["", "Hardware set up correctly and ready to start?"]
@@ -4776,7 +4989,9 @@ class QuickPrintWorkflowPage(QWidget):
             settings=g["settings"], pump=g["pump"], flow_rate=0.01,
             job_name=g.get("job_name")
             or f"Quick Print — {g['ink_name']} @ {g['well']}",
-            path_segments=g["segments"], return_home=False)
+            path_segments=g["segments"],
+            path_extrusion_profiles=g.get("extrusion_profiles"),
+            return_home=False)
         done = threading.Event()
         result = {"state": None}
         pm = PrintManager(self._controller)
@@ -5469,7 +5684,9 @@ class QuickPrintWorkflowPage(QWidget):
             return
 
         try:
-            path_segments = self._path_segments_for_selection()
+            # v7.21.5: the modifiers come back beside the segments, so the print
+            # deposits what the sketch computed per shape instead of one flow.
+            path_segments, path_mods =                 self._segments_and_modifiers_for_selection()
         except Exception as e:
             logger.exception("Quick Print geometry failed: %s", e)
             self._status.setText(f"Geometry error: {e}")
@@ -5680,6 +5897,11 @@ class QuickPrintWorkflowPage(QWidget):
                     lines.append(
                         f"      + circular pickup "
                         f"({pickup_kwargs['orbit_diameter_mm']:.2f} mm)")
+            hold_s = self._hold_in_liquid_s()
+            if hold_s > 0:
+                lines.append(
+                    f"      + hold in the liquid {hold_s:.1f}s before lifting "
+                    "(so the aspirate does not finish in air)")
             lines.append(f"  • Print “{obj_label}” in well {well}")
             if cleanup_enabled:
                 lines.append(
@@ -5700,6 +5922,10 @@ class QuickPrintWorkflowPage(QWidget):
             "well": well, "center": center, "path_points": path_points,
             "path_segments": path_segments, "settings": settings,
             "pump": pump, "obj_label": obj_label, "cleanup": cleanup_ctx,
+            # v7.21.5: resolved HERE, while the selection is known — the
+            # continuation runs after a worker thread and must not re-derive
+            # geometry (the operator may have touched a control meanwhile).
+            "extrusion_profiles": self._vol_per_mm_profiles(path_mods),
         }
 
         self._print_btn.setEnabled(False)
@@ -5863,6 +6089,10 @@ class QuickPrintWorkflowPage(QWidget):
             # v7.5.x: one PRINT_PATH per object with lift→travel→lower between
             # them, so a multi-object print doesn't extrude across the seams.
             path_segments=path_segments,
+            # v7.21.5: each sub-path's own deposition (µL/mm per segment) from
+            # the sketch's baked extrusion profile, so declared line widths and
+            # no-extrude sections print as designed. None → one flow (legacy).
+            path_extrusion_profiles=ctx.get("extrusion_profiles"),
             return_home=False,
         )
 

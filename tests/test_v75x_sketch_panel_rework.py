@@ -66,9 +66,12 @@ class TestPanelRework(unittest.TestCase):
         p = self._page()
         p._canvas.set_sketch(_two_ink_single_sketch())
         p._refresh_sequence()
-        # 3 sections → 3 clickable title buttons + 3 chevrons.
+        # 3 sections → 3 clickable title buttons; each section header carries
+        # a chevron plus (v7.21.4) a checkable no-extrude toggle.
         self.assertEqual(len(p._seq_host.findChildren(QPushButton)), 3)
-        self.assertEqual(len(p._seq_host.findChildren(QToolButton)), 3)
+        tbs = p._seq_host.findChildren(QToolButton)
+        self.assertEqual(len([b for b in tbs if not b.isCheckable()]), 3)
+        self.assertEqual(len([b for b in tbs if b.isCheckable()]), 3)
         # Each single-shape section lists exactly one operation row.
         op_rows = [l for l in p._seq_host.findChildren(QLabel)
                    if l.text().startswith("▪")]
