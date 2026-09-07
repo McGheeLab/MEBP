@@ -292,9 +292,22 @@ class TestNeedleLocTabLayout(unittest.TestCase):
             self.assertNotIsInstance(w.parentWidget(), QScrollArea)
             w = w.parentWidget()
 
-    def test_the_advanced_z_panel_is_collapsed_by_default(self):
+    def test_the_advanced_z_panel_is_OPEN_by_default(self):
+        """v7.17.1 — contract deliberately inverted (operator request).
+
+        It used to start collapsed, on the reasoning that step 2 carried the
+        primary flow and this was the escape hatch. In practice the panel holds
+        the reference-height picker, the live XZ side view used to drive Z, and
+        the plate-type learn/apply round trip — so hiding it hid the controls
+        operators reach for most, and the "assign to plate type" button in
+        particular was effectively undiscoverable.
+
+        It is now open, and lives in a vertical splitter so it can be dragged
+        much taller than the old fixed half-column. The toggle still exists for
+        reclaiming the space.
+        """
         page = self._page()
-        self.assertFalse(page._needle_loc_adv_btn.isChecked())
+        self.assertTrue(page._needle_loc_adv_btn.isChecked())
         # The reference-height labels still exist (setters write them).
         self.assertTrue(hasattr(page, "_zoff_lbl_plate_bottom_z"))
 

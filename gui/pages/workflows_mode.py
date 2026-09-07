@@ -30,6 +30,9 @@ from gui.pages.workflows.cell_labeling_workflow import (
     CellLabelingWorkflowPage,
 )
 from gui.pages.workflows.quick_print_workflow import QuickPrintWorkflowPage
+from gui.pages.workflows.print_calibrator_workflow import (
+    PrintCalibratorWorkflowPage,
+)
 from gui.pages.workflows.full_print_workflow import FullPrintWorkflowPage
 from gui.pages.workflows.fluorescence_mosaic_workflow import (
     FluorescenceMosaicWorkflowPage,
@@ -112,6 +115,12 @@ class WorkflowsModePage(QWidget):
                 )
             elif tile.workflow_id == "quick_print":
                 page = QuickPrintWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "print_calibrator":
+                page = PrintCalibratorWorkflowPage(
                     controller=controller,
                     settings=settings,
                     camera_manager=camera_manager,
@@ -266,6 +275,24 @@ class WorkflowsModePage(QWidget):
                 logger.debug("get_context_widget delegate failed: %s", e)
         return None
 
+    def context_label(self):
+        """v7.19: the name for the left box's native pill, delegated.
+
+        MainWindow labels that pill from a map keyed on the PAGE class, which
+        for every workflow is this one class — so a workflow whose panel is not
+        a jog panel (Fluorescence Mosaic's signal controls) would be labelled
+        "Jog". Returning None keeps MainWindow's default.
+        """
+        current = self._stack.currentWidget()
+        if current is None or current is self._picker:
+            return None
+        if hasattr(current, "context_label"):
+            try:
+                return current.context_label()
+            except Exception as e:
+                logger.debug("context_label delegate failed: %s", e)
+        return None
+
     def on_status_update(self):
         """Forward MainWindow's periodic tick to the active workflow."""
         current = self._stack.currentWidget()
@@ -294,6 +321,25 @@ class WorkflowsModePage(QWidget):
                     page.set_common_print_settings(common)
                 except Exception as e:
                     logger.debug("set_common_print_settings fanout failed: %s", e)
+
+    def refresh_speed_limits(self):
+        """v7.21.2: forward the speed-limit broadcast to the workflow pages.
+
+        ``MainWindow._refresh_all_speed_limits`` walks the top-level pages and their
+        jog/control panels, but the workflow pages live inside this mode page's
+        stack — so without this forwarder Quick Print never learned that the XY
+        calibration had just changed the machine's top speed, and kept showing a
+        stale speed cap and a stale "stage motion not characterised" warning until
+        the app was restarted.
+        """
+        for i in range(1, self._stack.count()):
+            page = self._stack.widget(i)
+            fn = getattr(page, "refresh_speed_limits", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as e:
+                    logger.debug("refresh_speed_limits fanout failed: %s", e)
 
     def set_well_list(self, wells: list[str]):
         for i in range(1, self._stack.count()):

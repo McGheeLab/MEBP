@@ -114,6 +114,22 @@ DEFAULT_PLATE_FLIP_180 = True
 JOG_SPEED_LADDER_PCT: tuple[float, ...] = (0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
 
 
+def _positive_number(value) -> float | None:
+    """``value`` as a positive float, or None if it is not a genuine number.
+
+    v7.21.1 — deliberately an ``isinstance`` check, NOT ``float(value)`` in a
+    ``try``: ``MagicMock`` implements ``__float__`` and answers 1.0, so the
+    coercing form silently accepts a stubbed attribute as a real measurement.
+    That matters here because the values guarded by this helper (the declared XY
+    top speed) become the DENOMINATOR of every mm/s→SMS-% conversion — a bogus
+    1.0 would scale every commanded speed by ~5000×.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    v = float(value)
+    return v if v > 0 else None
+
+
 def _jog_speed_ladder_step(current_pct: float, direction: int) -> float:
     """Step *current_pct* to the next (direction>0) / previous rung of
     ``JOG_SPEED_LADDER_PCT``, snapping from an arbitrary value to the nearest
@@ -1249,7 +1265,14 @@ class PositionPoller:
         self._lock = threading.Lock()
         self._xy_pos: tuple = (None, None, None)
         self._zp_pos: tuple = (None, None, None, None)
-        self._suspended = False  # v7.3.4: pause polling during programmatic moves
+        # v7.21.2: REFCOUNTED, not a bool. The XY calibration nests suspends —
+        # the orchestrator holds one across the whole run while each sub-probe
+        # (dead time, top speed) owns its own pair. With a plain bool the FIRST
+        # sub-probe's `finally` resumed polling for everything after it, so every
+        # later step was measured against a contended serial read path.
+        # `_suspended` stays readable as a bool via the property below, so every
+        # existing `if poller._suspended:` reader is unchanged.
+        self._suspend_depth = 0  # v7.3.4: pause polling during programmatic moves
 
         # v7.5.x: XY travel odometer. ``on_xy_travel(dist_um)`` is fired for each
         # poll sample with the straight-line XY distance from the previous
@@ -1274,10 +1297,21 @@ class PositionPoller:
         # enough to catch a power-off quickly. Scaled to the poll interval.
         self._zp_fail_threshold = max(5, int(2.5 / max(poll_interval, 0.05)))
 
+    @property
+    def _suspended(self) -> bool:
+        """True while ANY caller holds a suspend. Kept as the historical
+        attribute name so external readers (`getattr(p, "_suspended", False)`)
+        need no change."""
+        return self._suspend_depth > 0
+
     def suspend(self) -> None:
         """Pause hardware queries (e.g., during safe_travel_to) to prevent
-        serial races between the poll thread and caller-side waits."""
-        self._suspended = True
+        serial races between the poll thread and caller-side waits.
+
+        v7.21.2: nestable. Each `suspend()` must be matched by a `resume()`.
+        """
+        with self._lock:
+            self._suspend_depth += 1
 
     def resume(self) -> None:
         """Resume normal polling after a programmatic move completes."""
@@ -1289,7 +1323,11 @@ class PositionPoller:
         # the threshold on the very first post-resume read — that manufactures
         # a false "ZP disconnected" mid-print. Mirrors set_stages()'s reset.
         self._zp_fail_count = 0
-        self._suspended = False
+        # v7.21.2: only the OUTERMOST resume actually resumes. Clamped at zero so
+        # an unbalanced resume cannot poison a later suspend (the same rule the
+        # v7.9 print-floor refcount adopted).
+        with self._lock:
+            self._suspend_depth = max(0, self._suspend_depth - 1)
 
     def set_stages(
         self,
@@ -1513,6 +1551,9 @@ class StageController:
         # the caller from settings (zp_stage.last_port) and re-saved
         # whenever the ZP stage reports its connected_port.
         self._preferred_zp_port: str | None = None
+        # v7.18.1: last-known-good XY detection hint
+        # ({protocol, port, baud}) — the XY twin of _preferred_zp_port.
+        self._preferred_xy_hint: dict | None = None
 
         # v7.5.x: True once a REAL ZP board has connected this session. Sticky
         # (never reset on disconnect) so safe_travel_to can tell a dropped board
@@ -1576,6 +1617,17 @@ class StageController:
         # its established `safety_limits_changed` channel. Page-driven edits use
         # that Qt signal directly; this callback only serves backend emitters.
         self.on_speed_limits_changed: Callable | None = None
+
+        # v7.21.1: the operator-DECLARED true XY top speed (µm/s at 100%), from
+        # Hardware Setup → Device → XY Stage Calibration → "Max speed", or from
+        # the timing tool's measurement once the operator Applies it. None =
+        # never declared, which is DELIBERATELY distinguishable from "declared
+        # 10000": `SafetyLimits.max_xy_speed` defaults to 10000 µm/s, and
+        # pushing a DEFAULT into the mm/s↔SMS-% denominator would make every
+        # commanded speed run FASTER than requested on a stage whose real top
+        # speed is higher (SMS% = requested ÷ denominator). Only an explicit
+        # declaration may drive that denominator. See declared_xy_top_speed_um_s.
+        self._declared_xy_top_speed_um_s: float | None = None
 
         # v7.2: Hardware configuration (set by GUI when hardware setup completes)
         self._hardware_config: HardwareConfig | None = None
@@ -1785,6 +1837,10 @@ class StageController:
                     simulate=sim_xy,
                     controller_json=self.controller_json,
                     exclude_ports=xy_exclude,
+                    # v7.18.1: last-known-good (protocol, port, baud) so a
+                    # reconnect is ONE probe instead of re-walking every
+                    # protocol × baud that was ruled out last time.
+                    preferred=self._preferred_xy_hint,
                 )
             except (ConnectionError, ImportError, OSError) as e:
                 logger.error(f"XY stage connection failed: {e}")
@@ -1817,15 +1873,17 @@ class StageController:
             # correct for prints/jog WITHOUT having to open the timing tool.
             # Guarded — never blocks the connect.
             if not sim_xy:
-                try:
-                    from SupportClasses.PrintTimingCalibrationStore import (
-                        get_store as _get_tc_store,
-                    )
-                    _ms = _get_tc_store().get_xy_max_speed_um_s()
-                    if _ms and hasattr(self.xy_stage, "set_max_speed_um_s"):
-                        self.xy_stage.set_max_speed_um_s(_ms)
-                except Exception as e:
-                    logger.debug("apply stored XY max speed failed: %s", e)
+                # v7.21.1: ONE resolver (declared → measured), so the Hardware
+                # Setup field and the timing tool cannot disagree about the
+                # denominator. Undeclared ⇒ no-op, stage keeps its protocol
+                # max_speed (see declared_xy_top_speed_um_s for why).
+                self._push_xy_top_speed_to_stage()
+                # v7.18.1: adopt what actually answered, so an in-session
+                # reconnect (a USB drop, a Connect re-click) is already fast
+                # without waiting for the GUI to persist the hint.
+                hint = self.xy_connection_hint
+                if hint:
+                    self._preferred_xy_hint = hint
             logger.info(f"XY stage connected ({'SIM' if sim_xy else 'REAL'})")
 
         if zp and self.zp_stage is None:
@@ -1971,6 +2029,26 @@ class StageController:
         the next connect_stages() can try it first instead of
         scanning every tty."""
         self._preferred_zp_port = port
+
+    def set_preferred_xy_hint(self, hint: dict | None) -> None:
+        """v7.18.1: cache the last-known-good XY (protocol, port, baud) so the
+        next connect_stages() probes it directly instead of re-walking every
+        protocol JSON × baud × port.
+
+        A stale hint is harmless — the probe misses and the full scan runs.
+        """
+        self._preferred_xy_hint = dict(hint) if isinstance(hint, dict) else None
+
+    @property
+    def xy_connection_hint(self) -> dict | None:
+        """v7.18.1: {protocol, port, baud} the live XY stage actually opened.
+
+        None when simulating or not connected — never persist a hint that
+        would point the next launch at something that never answered.
+        """
+        if self.xy_stage and not self.simulate_xy:
+            return getattr(self.xy_stage, "detection_hint", None)
+        return None
 
     @property
     def zp_connected_port(self) -> str | None:
@@ -2602,6 +2680,52 @@ class StageController:
             "plate_bottom_z": self.user_z_to_zref(bottom_user),
             "safe_z": self.user_z_to_zref(safe_user),
             "plate_max_z": self.user_z_to_zref(max_user),
+        }
+
+    def plate_z_refs_from_top(self, top_zref: float) -> dict | None:
+        """Derive the other plate Z references from a TAUGHT Plate Top Z.
+
+        v7.17.1. ``estimate_plate_z_refs`` anchors every guess on the
+        needle-cam fiducial, which is a property of the MACHINE. Once the
+        operator has actually touched off the plate's top surface, the taught
+        top is a far better anchor for this particular plate and seating: it
+        absorbs plate-to-plate thickness variation and any drift in the
+        fiducial, while the plate type still supplies the one thing it really
+        knows — the SPACING between its own features.
+
+        The stored offsets are mm BELOW the fiducial, so the fiducial cancels:
+
+            user_z(k) = user_z(top) − (offset[k] − offset["top"])
+
+        Returns ``{"plate_bottom_z", "safe_z", "plate_max_z"}`` in zero-ref mm
+        — deliberately NOT ``plate_top_z``, which is the input. ``None`` when
+        the active plate has no stored offsets, because every delta would then
+        be zero and the caller would be told the well floor is exactly at the
+        plate's top surface: a confident, wrong, and dangerous answer.
+
+        NOTE — the bore wizard's step 2 uses the SAME identity for one pair
+        (``NeedleBoreWizard._plate_top_bottom_distance`` = ``bottom − top``,
+        with the same "the fiducial cancels" reasoning). That one yields a
+        scalar spacing to seed a typed spin box; this one maps every stored
+        reference into the zero-ref frame. Kept separate deliberately: folding
+        the hardware-verified v7.13 path into this would change a tested
+        descent-planning input for no functional gain.
+        """
+        off = self._plate_z_offsets or {}
+        if not any(k in off for k in ("top", "bottom", "safe", "max")):
+            return None
+        top_off = float(off.get("top", 0.0))
+        top_user = self.zref_to_user_z(float(top_zref))
+
+        def _from(key: str) -> float:
+            # + is DOWN here: a feature further below the fiducial than the
+            # top is that much below the taught top.
+            return top_user - (float(off.get(key, top_off)) - top_off)
+
+        return {
+            "plate_bottom_z": self.user_z_to_zref(_from("bottom")),
+            "safe_z": self.user_z_to_zref(_from("safe")),
+            "plate_max_z": self.user_z_to_zref(_from("max")),
         }
 
     def apply_z_convention(self, z_up_sign: float | None = None,
@@ -3259,7 +3383,8 @@ class StageController:
                               steps_per_mm: dict | None = None,
                               per_axis_max_feedrate: dict | None = None,
                               persist_steps: bool = False,
-                              persist_feedrate: bool = False) -> None:
+                              persist_feedrate: bool = False,
+                              xy_max_speed_um_s: float | None = None) -> None:
         """v7.4.2: Push device-level settings into a connected ZP stage.
 
         Called by MainWindow after construction (or when the user clicks
@@ -3276,7 +3401,16 @@ class StageController:
                 so the new calibration takes effect on Marlin.
             persist_feedrate: If True and zp_stage is connected, send M203
                 so the new per-axis feedrate ceilings take effect on Marlin.
+            xy_max_speed_um_s: v7.21.1 — this machine's DECLARED true XY top
+                speed (µm/s at 100%), from Hardware Setup → Device → XY Stage
+                Calibration. None to skip (leaves any existing declaration
+                alone), so callers that only push axis/stepper settings are
+                unchanged.
         """
+        # v7.21.1: declared FIRST — safe_travel_to and the jog anchors resolve
+        # through it, so it must be in force before anything else re-anchors.
+        if xy_max_speed_um_s is not None:
+            self.set_xy_top_speed_um_s(xy_max_speed_um_s)
         # Cache for next connect
         if axis_map is not None:
             self._pending_axis_map = dict(axis_map)
@@ -3686,18 +3820,123 @@ class StageController:
     _XY_MAX_FALLBACK_UM_S: float = 10_000.0   # µm/s
     _Z_MAX_FALLBACK_MM_MIN: float = 500.0     # mm/min
 
+    def _explicit_xy_top_speed_um_s(self) -> float | None:
+        """Only the operator's explicit declaration (Hardware Setup → Device →
+        XY Stage Calibration → Max speed, or the timing tool's Apply). None when
+        never declared.
+
+        Accepts only a genuine number. ``float()`` alone is NOT enough: a
+        ``MagicMock`` implements ``__float__`` and answers 1.0, so a
+        partially-stubbed controller — the pattern this repo's GUI tests use —
+        would otherwise inject a 1 µm/s "top speed" that every speed command
+        then scales against, and the test would pass while production was
+        wrong."""
+        return _positive_number(getattr(self, "_declared_xy_top_speed_um_s", None))
+
+    def declared_xy_top_speed_um_s(self) -> float | None:
+        """The EXPLICITLY declared true XY top speed (µm/s at 100%), or None.
+
+        v7.21.1: this is the authority behind the Hardware Setup → Device → XY
+        Stage Calibration "Max speed" field. It is deliberately separate from
+        :meth:`get_max_xy_speed_um_s`, which can never answer None because
+        ``SafetyLimits.max_xy_speed`` carries a 10000 µm/s DEFAULT.
+
+        That distinction is load-bearing, not tidiness. This value becomes the
+        denominator in ``XYStage.set_speed_mm_s`` (``SMS% = requested ÷ top``),
+        so declaring a top speed BELOW the stage's real one makes every
+        commanded speed run proportionally FASTER than asked. A machine that has
+        never declared one must therefore keep the protocol's own ``max_speed``,
+        not inherit a policy default — hence None rather than a fallback.
+
+        Precedence: operator declaration → the timing tool's stored measurement
+        (legacy: pre-v7.21.1 the tool wrote there silently; it now offers the
+        value for explicit Apply instead) → None (undeclared).
+
+        NOTE the deliberate asymmetry with :meth:`get_max_xy_speed_um_s`: there,
+        ``safety_limits.max_xy_speed`` outranks the stored measurement, because
+        editing the safety value must propagate over a stale measurement. Here
+        the safety value is absent entirely — it carries a default and so cannot
+        assert anything about the physical stage.
+        """
+        v = self._explicit_xy_top_speed_um_s()
+        if v:
+            return v
+        try:
+            from SupportClasses.PrintTimingCalibrationStore import (
+                get_store as _get_tc_store,
+            )
+            ms = _get_tc_store().get_xy_max_speed_um_s()
+            if ms and float(ms) > 0:
+                return float(ms)
+        except Exception:
+            pass
+        return None
+
+    def set_xy_top_speed_um_s(self, value_um_s: float) -> None:
+        """Declare this machine's true XY top speed (µm/s at 100%) and make it
+        authoritative EVERYWHERE, in one call.
+
+        Three consumers, all updated together so they cannot drift:
+          1. ``XYStage._max_speed_um_s`` — the mm/s↔SMS-% denominator, so a
+             commanded mm/s actually produces that mm/s.
+          2. ``safety_limits.max_xy_speed`` — the 100% anchor every jog / print
+             speed-% surface reads through :meth:`get_max_xy_speed_um_s`.
+          3. the jog handlers' anchors, re-applied with the operator's %.
+
+        The caller persists it (Hardware Setup writes both
+        ``safety_limits.max_xy_speed`` and ``device_profile.xy_max_speed_um_s``).
+        """
+        try:
+            v = float(value_um_s)
+        except (TypeError, ValueError):
+            return
+        if v <= 0:
+            return
+        self._declared_xy_top_speed_um_s = v
+        sl = getattr(self, "safety_limits", None)
+        if sl is not None:
+            try:
+                sl.max_xy_speed = v
+            except Exception as e:
+                logger.debug("set_xy_top_speed_um_s: safety mirror failed: %s", e)
+        self._push_xy_top_speed_to_stage()
+        try:
+            self.refresh_jog_speed_limits()
+        except Exception as e:
+            logger.debug("refresh_jog_speed_limits (top speed) failed: %s", e)
+
+    def _push_xy_top_speed_to_stage(self) -> None:
+        """Seed the connected ``XYStage``'s mm/s↔SMS denominator from the
+        declared top speed. No-op when nothing is declared (the stage keeps its
+        protocol ``max_speed``) or no stage is connected. Never raises."""
+        top = self.declared_xy_top_speed_um_s()
+        if not top:
+            return
+        xy = getattr(self, "xy_stage", None)
+        if xy is None or not hasattr(xy, "set_max_speed_um_s"):
+            return
+        try:
+            xy.set_max_speed_um_s(float(top))
+        except Exception as e:
+            logger.debug("push XY top speed to stage failed: %s", e)
+
     def get_max_xy_speed_um_s(self) -> float:
         """The single XY top speed (µm/s) every surface reads — the 100% anchor
-        for jog % and print speed %.
+        for jog %, print speed %, and (v7.21.1) safe-travel speed.
 
-        ``safety_limits.max_xy_speed`` IS the one editable value: editing it on
-        the Stage panel, or the timing tool's "Measure top speed" (which writes
-        it), propagates to every page through this resolver. The measured
-        timing-store value is a fallback only when no safety value is set
-        (legacy / unset), then a conservative constant. (The separate
-        ``XYStage._max_speed_um_s`` SMS denominator stays seeded from the store
-        at connect for correct mm/s↔SMS scaling — that's physics, not the
-        anchor.)"""
+        Precedence: the operator's explicit declaration →
+        ``safety_limits.max_xy_speed`` → the timing tool's stored measurement →
+        a conservative constant.
+
+        The declaration is first so the Hardware Setup field is the authority
+        (:meth:`set_xy_top_speed_um_s` keeps the safety mirror in sync, so in
+        practice the two agree and the order only matters for a legacy settings
+        file). The stored measurement stays BELOW the safety value, unchanged
+        from v7.5.x: editing the safety value must still propagate over a stale
+        measurement."""
+        declared = _positive_number(self._explicit_xy_top_speed_um_s())
+        if declared:
+            return declared
         sl = getattr(self, "safety_limits", None)
         if sl is not None and getattr(sl, "max_xy_speed", 0):
             try:
@@ -5415,8 +5654,9 @@ class StageController:
         parse, and after ~2.5 s of consecutive failures the liveness watchdog
         FALSE-POSITIVES a "ZP disconnected" mid-print. Callers that run such a
         write burst (e.g. the discrete PRINT_PATH) suspend the poller for the
-        duration. Idempotent and guarded — safe when no poller exists (e.g.
-        headless/mock controllers). ALWAYS pair with
+        duration. v7.21.2: REFCOUNTED, so nested suspends are safe — an inner
+        probe's resume no longer un-suspends an outer caller. Guarded — safe
+        when no poller exists (e.g. headless/mock controllers). ALWAYS pair with
         :meth:`resume_position_poller` in a try/finally so an abort/exception
         cannot leave the poller (and the live position display) frozen.
         """
@@ -5431,6 +5671,25 @@ class StageController:
         p = getattr(self, "_pos_poller", None)
         if p is not None:
             p.resume()
+
+    def is_position_poller_suspended(self) -> bool:
+        """v7.19: True while some sequence has the position poller suspended.
+
+        Read as a cheap PROXY for "another workflow is currently driving the
+        stage" — every long programmatic sequence in this app (a print's
+        PRINT_PATH, a mosaic scan, ``safe_travel_to``) suspends the poller for
+        its duration, so the flag being set means one of them is in flight.
+        Quick Print's held print queue uses it to refuse a Resume that would put
+        a second driver on the serial channel: ``_stage_busy()`` is a per-PAGE
+        guard, so a workflow cannot otherwise see what another page is doing.
+
+        ⚠ A proxy, NOT a lease. It catches a running scan or print; it does not
+        catch a manual jog, and it cannot say WHICH workflow is driving. A
+        process-wide stage lease is the real fix. Guarded (returns False when
+        there is no poller) so a mock/headless controller reads as idle.
+        """
+        p = getattr(self, "_pos_poller", None)
+        return bool(getattr(p, "_suspended", False)) if p is not None else False
 
     def suspend_zp_watchdog(self) -> None:
         """v7.5.x: pause the ZP port-health watchdog for the duration of a dense
@@ -5481,7 +5740,7 @@ class StageController:
         target_y_um: float,
         safe_z_mm: float,
         target_z_mm: float | None = None,
-        fast_xy_speed_mm_s: float = 50.0,
+        fast_xy_speed_mm_s: float | None = None,
         z_timeout_s: float = 15.0,
         xy_timeout_s: float = 30.0,
         apply_insert_floor: bool = True,
@@ -5504,7 +5763,18 @@ class StageController:
             safe_z_mm: Safe travel height in mm (zero-referenced).
             target_z_mm: Optional target Z after XY move (zero-referenced).
                          If None, stays at safe_z.
-            fast_xy_speed_mm_s: XY travel speed in mm/s.
+            fast_xy_speed_mm_s: XY travel speed in mm/s. v7.21.1 — ``None``
+                (the default) resolves to this machine's configured XY max
+                speed via :meth:`get_max_xy_speed_um_s`.
+
+                This used to default to a hardcoded ``50.0`` that NO caller
+                overrode, so every travel — the fluorescence mosaic's first
+                tile, Quick Print's pre-position, pick & place, calibration
+                navigation — commanded 50 mm/s regardless of what Hardware
+                Setup said, and (Prior SMS being modal) every subsequent
+                un-speeded move inherited it. That is the bug this default
+                fixes; a caller with a genuine reason for a different speed
+                still passes one explicitly.
             z_timeout_s: Max seconds to wait for Z arrival.
             xy_timeout_s: Max seconds to wait for XY arrival.
             abort_event: v7.6 — optional ``threading.Event``. When set, the
@@ -5593,9 +5863,37 @@ class StageController:
                             "not starting the XY travel")
                 return False
             if self.is_xy_connected:
+                _travel_mm_s = fast_xy_speed_mm_s
+                if _travel_mm_s is None:
+                    try:
+                        _travel_mm_s = float(self.get_max_xy_speed_um_s()) / 1000.0
+                    except (TypeError, ValueError):
+                        _travel_mm_s = 0.0
+                    if not _travel_mm_s or _travel_mm_s <= 0:
+                        _travel_mm_s = self._XY_MAX_FALLBACK_UM_S / 1000.0
+                    # An UNDECLARED machine is the one case where the commanded
+                    # mm/s and the achieved mm/s can still disagree: the stage
+                    # converts against its protocol's nominal max_speed, so a
+                    # travel commanded at the (lower) safety anchor comes out
+                    # proportionally slow. Safe — slow, never fast — but it
+                    # looks like a fault, so name the one-click remedy. Once per
+                    # session; the flag lives on the instance.
+                    if (not self.declared_xy_top_speed_um_s()
+                            and not getattr(self, "_warned_xy_top_undeclared",
+                                            False)):
+                        self._warned_xy_top_undeclared = True
+                        logger.warning(
+                            "XY travel is using %.2f mm/s, but this machine has "
+                            "no declared top speed, so the stage is still "
+                            "converting mm/s against its protocol default — "
+                            "travel may run slower than commanded. Set Hardware "
+                            "Setup → Device → XY Stage Calibration → Max speed "
+                            "(or measure it: Workflows → XY↔ZP Timing "
+                            "Calibration → Measure top speed → Apply).",
+                            _travel_mm_s)
                 if hasattr(self, 'xy_stage') and self.xy_stage:
                     if hasattr(self.xy_stage, 'set_speed_mm_s'):
-                        self.xy_stage.set_speed_mm_s(fast_xy_speed_mm_s)
+                        self.xy_stage.set_speed_mm_s(_travel_mm_s)
                     else:
                         self.xy_stage.set_velocity(100)
                 self.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
@@ -5608,9 +5906,26 @@ class StageController:
                 if not self.wait_for_xy_arrival(target_x_mm, target_y_mm,
                                                 tolerance_mm=0.5,
                                                 timeout_s=xy_timeout_s):
-                    logger.warning("safe_travel_to: XY arrival timed out — "
-                                   "proceeding with Z descent anyway")
-                    ok = False
+                    # v7.20 CRITICAL SAFETY — this used to log
+                    # "proceeding with Z descent anyway" and then LOWER THE
+                    # NEEDLE at an unverified position. That is a broken needle
+                    # against the plate or a well wall, and it is the documented
+                    # bench failure this guard exists to prevent.
+                    #
+                    # Note the asymmetry it removes: step 1 already ABORTS when
+                    # the Z RETRACT cannot be confirmed. An unconfirmed XY
+                    # arrival is no less dangerous — it is the difference
+                    # between descending into a well and descending into its
+                    # rim — so it now fails closed the same way. The needle is
+                    # left RETRACTED at the safe height, which is the recoverable
+                    # outcome; the caller sees False.
+                    logger.error(
+                        "safe_travel_to: XY arrival NOT confirmed "
+                        "(target=%.3f, %.3f mm) — ABORTING before the Z "
+                        "descent; leaving the needle retracted at the safe "
+                        "height rather than lowering it at an unverified "
+                        "position", target_x_mm, target_y_mm)
+                    return False
 
             # Step 3: Lower Z to target and WAIT. v7.5.x: the descent's FINAL
             # _descend_slow_dist_mm runs slowly (gentle, controlled re-entry
@@ -5917,6 +6232,7 @@ class StageController:
         speed_um_s: float = 2000.0,
         amplitude_um: float = 600.0,
         on_progress=None,
+        stop_evt=None,
     ) -> dict:
         """Measure the achievable CLOSED-LOOP control cadence — the period of
         one interleaved *(send a motion command + read a fresh position)* cycle
@@ -5986,6 +6302,11 @@ class StageController:
         self.suspend_position_poller()
         try:
             for i in range(max(1, int(iterations))):
+                # v7.21.2: cooperative abort. Without this the probe runs its
+                # full ~2.3 s regardless, which is the whole abort latency of
+                # the calibration's first step.
+                if stop_evt is not None and stop_evt.is_set():
+                    break
                 t_loop = time.monotonic()
                 # 1) a MOTION command (the thing that makes this "while moving")
                 t_c = time.monotonic()
@@ -6191,6 +6512,31 @@ class StageController:
         cfg = self._hardware_config
         try:
             return max(0.0, float(getattr(cfg, "pump_settle_time_s", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def pump_post_aspirate_dwell_s(self) -> float:
+        """v7.21.7: configured global HOLD-IN-LIQUID dwell (s) after a reagent
+        aspirate, 0 if unset / no config. Set on Hardware Setup → Pump (and the
+        Common Print Settings page).
+
+        This is NOT the same thing as :meth:`pump_settle_time_s`, and the
+        difference is the whole point: the settle dwell brackets a pump move and
+        the move itself already BLOCKS until the plunger has physically drained
+        from Marlin's planner — so the *plunger* is provably finished. The fluid
+        is not. A compliant column (fine bore, viscous ink, long tube) keeps
+        drawing liquid in for a while after the plunger stops, so the needle has
+        to STAY SUBMERGED for that tail. Retracting Z inside that window puts the
+        tip in air and the tail of the aspirate becomes air.
+
+        Consumed by :class:`PickPlaceExecutor` at every reagent aspirate (ink,
+        oil, buffer) — which is where the needle is in liquid and a travel
+        follows. Deliberately NOT applied to the streamed print path, to a
+        dispense, or to manual jog."""
+        cfg = self._hardware_config
+        try:
+            return max(0.0, float(
+                getattr(cfg, "pump_post_aspirate_dwell_s", 0.0) or 0.0))
         except (TypeError, ValueError):
             return 0.0
 

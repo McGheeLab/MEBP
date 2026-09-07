@@ -1,0 +1,26 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "fluorescence_mosaic",
+  "name": "Rhodamine LLS",
+  "saved": "2026-08-13T16:35:30",
+  "values": {
+    "target_px": 2500,
+    "well_margin": 1.15,
+    "exposure_ms_dapi": 0.0,
+    "exposure_ms_fitc": 0.0,
+    "exposure_ms_mcherry": 50.0,
+    "exposure_ms_cy5": 0.0,
+    "exposure_ms_bright_field": 0.0,
+    "af_enabled": false,
+    "af_lattice": 2,
+    "af_step_um": 0.0,
+    "af_range_um": 0.0,
+    "post_denoise": {
+      "text": "off",
+      "data": "off"
+    },
+    "post_denoise_strength": 1,
+    "post_bg_subtract": false,
+    "post_bg_radius_um": 100.0
+  }
+}

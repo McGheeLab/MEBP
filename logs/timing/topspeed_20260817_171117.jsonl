@@ -1,0 +1,7 @@
+{"event": "config", "kind": "top_speed_sweep", "distances_mm": [2.0, 4.0, 6.0, 8.0, 10.0], "repeats": 2, "still_window_s": 0.35}
+{"event": "point", "dist_mm": 2.0, "time_s": 0.5869209500087891, "reps": 2}
+{"event": "point", "dist_mm": 4.0, "time_s": 0.9203091000090353, "reps": 2}
+{"event": "point", "dist_mm": 6.0, "time_s": 1.2492784999776632, "reps": 2}
+{"event": "point", "dist_mm": 8.0, "time_s": 1.6021176499780267, "reps": 2}
+{"event": "point", "dist_mm": 10.0, "time_s": 1.911095400020713, "reps": 2}
+{"event": "fit", "slope_s_per_mm": 0.166508, "intercept_s": 0.2549, "top_speed_mm_s": 6.0057}

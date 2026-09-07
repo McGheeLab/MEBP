@@ -34,7 +34,8 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
+    QAbstractButton, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QFileDialog, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -51,9 +52,26 @@ logger = logging.getLogger(__name__)
 #  Generic widget value get / set
 # ════════════════════════════════════════════════════════════════════
 
+def _is_toggle(w: QWidget) -> bool:
+    """A boolean control: a checkbox, or any CHECKABLE button.
+
+    v7.19.3 — widened from ``isinstance(w, QCheckBox)``. The fluorescence
+    panel's camera-preset control is a checkable ``QPushButton`` (it reads
+    "📷 Fluorescence" / "📷 Camera defaults", which a checkbox
+    cannot), and ``register_external`` accepted it while ``widget_value``
+    silently returned None for it — so it was registered, never saved, and reset
+    on every launch.
+
+    ``QCheckBox`` IS a ``QAbstractButton`` and is always checkable, so this is
+    behaviour-identical for every field that already existed; a non-checkable
+    button still falls through to "unrecognised" exactly as before.
+    """
+    return isinstance(w, QAbstractButton) and w.isCheckable()
+
+
 def widget_value(w: QWidget):
     """Read a JSON-serialisable value out of a config widget."""
-    if isinstance(w, QCheckBox):
+    if _is_toggle(w):
         return bool(w.isChecked())
     if isinstance(w, QSpinBox):
         return int(w.value())
@@ -75,7 +93,7 @@ def connect_widget_changed(w: QWidget, slot) -> bool:
     Used by ``notify_on_field_change`` so a page's ``on_change`` genuinely means
     "some setting changed" — previously a field with no hand-written handler
     edited silently and the page's derived readouts went stale."""
-    if isinstance(w, QCheckBox):
+    if _is_toggle(w):
         w.toggled.connect(slot)
     elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
         w.valueChanged.connect(slot)
@@ -90,7 +108,7 @@ def set_widget_value(w: QWidget, val) -> bool:
     """Apply a stored value to a config widget. Returns False if a combo's
     target isn't present yet (caller should mark it pending and retry once the
     combo is populated)."""
-    if isinstance(w, QCheckBox):
+    if _is_toggle(w):
         w.setChecked(bool(val))
         return True
     if isinstance(w, QSpinBox):
@@ -146,12 +164,42 @@ def set_widget_value(w: QWidget, val) -> bool:
 #  Section helper
 # ════════════════════════════════════════════════════════════════════
 
+def section_id_for(title: str) -> str:
+    """Slugify a section title into its persistence id.
+
+    The title is the id on purpose: an ORDINAL would shift every stored
+    promotion the moment a section is inserted above it, whereas a renamed
+    section simply loses its stored promotion and reverts to the popout —
+    self-healing, because both ``promoted()`` and ``merge_order()`` ignore an id
+    that no longer exists. ⚠ Many-to-one by construction (punctuation is
+    dropped), so :meth:`WorkflowSettingsDialog.add_section` DEDUPES rather than
+    letting two sections share one id and fight over one checkbox.
+    """
+    out = []
+    for ch in str(title).strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "_":
+            out.append("_")
+    return ("".join(out).strip("_")) or "section"
+
+
 class SettingsSection:
     """A titled group of settings rows inside the dialog scroll body."""
 
-    def __init__(self, dialog: "WorkflowSettingsDialog", card: Card):
+    def __init__(self, dialog: "WorkflowSettingsDialog", card: Card,
+                 section_id: str = ""):
         self._dialog = dialog
         self._card = card
+        self._section_id = section_id
+
+    @property
+    def section_id(self) -> str:
+        """This section's persistence id (see :func:`section_id_for`)."""
+        return self._section_id
+
+    def card(self) -> Card:
+        return self._card
 
     def add(self, key: str, label: str, widget: QWidget, default,
             help: str | None = None) -> QWidget:
@@ -311,6 +359,13 @@ class WorkflowSettingsDialog(QDialog):
         # ink). Without this a restored "(none)" choice would be clobbered by
         # that default on the first set_hardware_config.
         self._reapply_combos: dict[str, object] = {}
+
+        # v7.21 — section promotion. `_sections` is ordered by insertion, which
+        # IS the ordinal a restored card is placed by (see _restore_index).
+        self._sections: dict[str, dict] = {}
+        self._promo_host = None
+        self._promo_store = None
+        self._promo_on_change = None
 
         self._info_card: Card | None = None
         self._info_refresher: Optional[Callable[[], QWidget]] = None
@@ -506,10 +561,215 @@ class WorkflowSettingsDialog(QDialog):
 
     # ── Sections ──────────────────────────────────────────────────
 
-    def add_section(self, title: str, collapsible: bool = False) -> SettingsSection:
+    def add_section(self, title: str, collapsible: bool = False, *,
+                    section_id: str | None = None,
+                    promotable: bool = True) -> SettingsSection:
+        """Add a titled settings section.
+
+        v7.21: unless ``promotable=False``, the section's header carries a
+        checkbox that MOVES the whole card onto the workflow's main page (see
+        :meth:`set_promotion_host`). Moving the card — rather than rebuilding it
+        there — is what keeps every field registered: this dialog persists by
+        widget IDENTITY, so a section's placement is irrelevant to save, load,
+        Reset and the Common-Print-Settings links.
+        """
         card = Card(title, collapsible=collapsible)
         self._content_layout.addWidget(card)
-        return SettingsSection(self, card)
+        sid = str(section_id or section_id_for(title))
+        if sid in self._sections:
+            n = 2
+            while f"{sid}_{n}" in self._sections:
+                n += 1
+            logger.debug("duplicate settings section id %r in %s — using %s_%d",
+                         sid, self._workflow_id, sid, n)
+            sid = f"{sid}_{n}"
+        section = SettingsSection(self, card, sid)
+        self._sections[sid] = {
+            "card": card, "title": title, "section": section,
+            "ordinal": len(self._sections), "promotable": bool(promotable),
+            "check": None,
+        }
+        if promotable:
+            self._add_promote_check(sid)
+        return section
+
+    # ── Section promotion (v7.21) ─────────────────────────────────
+
+    def _add_promote_check(self, sid: str) -> None:
+        """Put the 'move to the workflow page' checkbox in the card's header.
+
+        Built for every promotable section regardless of whether a host has been
+        registered yet, then shown/hidden by :meth:`_sync_promote_checks` — the
+        page registers its host after ``_build_settings_dialog`` has already run,
+        so deferring the build would mean rebuilding headers later.
+        """
+        info = self._sections.get(sid)
+        if info is None:
+            return
+        chk = QCheckBox("On page")
+        chk.setToolTip(
+            "Move this whole section out of this popout and onto the workflow "
+            "page, where it can be reordered with the other cards.\n"
+            "Untick (or press ↩ on the card) to bring it back here.")
+        # Visibility is decided in ONE place — _sync_promote_checks, called just
+        # below and again whenever a host is (de)registered. Hardcoding the
+        # initial state here as well would be a second enforcement point, and a
+        # mutation of either alone would then look harmless.
+        chk.toggled.connect(
+            lambda on, k=sid: self._on_promote_toggled(k, bool(on)))
+        if info["card"].add_header_widget(chk) is None:
+            # No header (a card built without a title) — nothing to hang it on.
+            info["promotable"] = False
+            chk.deleteLater()
+            return
+        info["check"] = chk
+        self._sync_promote_checks()
+
+    def set_promotion_host(self, host, *, layout_store=None,
+                           on_change=None) -> None:
+        """v7.21: tell this dialog where a promoted section should go.
+
+        ``host`` is a ``SectionStack`` (duck-typed: ``add`` / ``take`` / ``has`` /
+        ``ids``). ``layout_store`` is a ``WorkflowLayoutStore`` used to remember
+        which sections are promoted, as a MACHINE preference rather than part of
+        the saved profile. ``on_change`` is called after any promotion change, so
+        the page can re-persist its card order.
+
+        Until this is called the checkboxes stay hidden: a checkbox that moves a
+        section nowhere is worse than no checkbox.
+        """
+        self._promo_host = host
+        self._promo_store = layout_store
+        self._promo_on_change = on_change
+        self._sync_promote_checks()
+        self.restore_promotions()
+
+    def _sync_promote_checks(self) -> None:
+        have = self._promo_host is not None
+        for info in self._sections.values():
+            chk = info.get("check")
+            if chk is not None:
+                chk.setVisible(have)
+
+    def promotable_sections(self) -> list[tuple[str, str]]:
+        """``(section_id, title)`` for every section that can be promoted."""
+        return [(sid, info["title"]) for sid, info in self._sections.items()
+                if info.get("promotable")]
+
+    def is_section_promoted(self, sid: str) -> bool:
+        host = self._promo_host
+        return bool(host is not None and host.has(sid))
+
+    def _on_promote_toggled(self, sid: str, on: bool) -> None:
+        # No re-entry guard, deliberately: set_section_promoted is IDEMPOTENT
+        # (it returns early unless the host's membership actually has to change),
+        # so the toggled → set → _sync_check → toggled loop terminates on its own
+        # after one pass. A `_promo_applying` flag as well would be a second
+        # enforcement point for one fact — and a mutation proved it never fired,
+        # because the idempotence check always got there first.
+        self.set_section_promoted(sid, on)
+
+    def set_section_promoted(self, sid: str, on: bool, *,
+                             persist: bool = True,
+                             notify: bool = True) -> bool:
+        """Move section ``sid`` onto the page (``on``) or back into this popout.
+
+        Returns True when something moved. The card is REPARENTED — a widget has
+        exactly one parent, so a promoted section genuinely leaves this popout
+        rather than appearing in both places.
+        """
+        info = self._sections.get(sid)
+        host = self._promo_host
+        if info is None or host is None or not info.get("promotable"):
+            return False
+        card = info["card"]
+        moved = False
+        if on and not host.has(sid):
+            # No explicit removeWidget: adding the card to the host's layout
+            # REPARENTS it, and Qt drops a reparented widget from its previous
+            # layout by itself (verified — a mutation deleting an explicit
+            # removeWidget here changed nothing, which is what proved the call
+            # redundant). One mechanism, not two.
+            host.add(sid, card, label=info["title"], returnable=True)
+            moved = True
+        elif not on and host.has(sid):
+            got = host.take(sid)
+            if got is not None:
+                self._content_layout.insertWidget(
+                    self._restore_index(sid), got)
+            moved = True
+        if not moved:
+            return False
+        self._sync_check(sid, on)
+        if persist and self._promo_store is not None:
+            try:
+                self._promo_store.set_promoted(self._workflow_id, sid, on)
+            except Exception as exc:
+                logger.debug("promotion persist failed: %s", exc)
+        if notify and self._promo_on_change is not None:
+            try:
+                self._promo_on_change()
+            except Exception as exc:
+                logger.debug("promotion on_change failed: %s", exc)
+        return True
+
+    def _sync_check(self, sid: str, on: bool) -> None:
+        """Make the checkbox agree with reality (a restore, or ↩ on the card).
+
+        Safe to fire ``toggled`` from here: see :meth:`_on_promote_toggled` — the
+        move it triggers is idempotent and stops immediately.
+        """
+        info = self._sections.get(sid)
+        chk = info.get("check") if info else None
+        if chk is None or chk.isChecked() == bool(on):
+            return
+        chk.setChecked(bool(on))
+
+    def _restore_index(self, sid: str) -> int:
+        """Where an un-promoted card goes back in the popout body.
+
+        Its ORIGINAL neighbours, not its original absolute index: sections above
+        it may themselves be promoted right now, so a stored index would drift.
+        Insert before the first still-present section with a larger ordinal, else
+        at the end of the cards (and always BEFORE finalize()'s trailing
+        stretch, which is why the index comes from a widget scan).
+        """
+        info = self._sections.get(sid) or {}
+        mine = int(info.get("ordinal", 0))
+        best = None
+        for other, oinfo in self._sections.items():
+            if other == sid or int(oinfo.get("ordinal", 0)) <= mine:
+                continue
+            idx = self._content_layout.indexOf(oinfo["card"])
+            if idx >= 0 and (best is None or idx < best):
+                best = idx
+        if best is not None:
+            return best
+        last = -1
+        for oinfo in self._sections.values():
+            idx = self._content_layout.indexOf(oinfo["card"])
+            if idx > last:
+                last = idx
+        return last + 1 if last >= 0 else 0
+
+    def restore_promotions(self) -> None:
+        """Re-apply the stored set of promoted sections. Idempotent."""
+        store = self._promo_store
+        if self._promo_host is None or store is None:
+            return
+        try:
+            wanted = store.promoted(self._workflow_id)
+        except Exception as exc:
+            logger.debug("promotion restore read failed: %s", exc)
+            return
+        for sid in wanted:
+            # persist=False AND notify=False: this IS the stored state, not an
+            # operator edit. 🐞 Without notify=False the host's on_change fired
+            # per restored section and persisted the CURRENT (default) card order
+            # over the stored one — so the arrangement was silently reset to
+            # default on every launch while the promotions themselves survived,
+            # which reads as "reordering doesn't persist". Mutation-pinned.
+            self.set_section_promoted(sid, True, persist=False, notify=False)
 
     def add_info_section(self, title: str = "Locations & Hardware") -> Card:
         """Add the read-only info card. Its body is rebuilt by the registered

@@ -41,12 +41,14 @@ from PySide6.QtGui import QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QSpinBox, QDoubleSpinBox, QFrame, QSizePolicy, QPlainTextEdit, QSplitter,
-    QComboBox,
+    QComboBox, QProgressBar,
 )
 
 from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card
+from gui.widgets.section_stack import (
+    PromotedSectionsPanel, wire_section_promotion)
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.dialogs.workflow_settings_dialog import (
@@ -54,6 +56,8 @@ from gui.dialogs.workflow_settings_dialog import (
 )
 
 from SupportClasses.PrintTimingCalibrationStore import get_store
+from SupportClasses import XYCalibrationRun as _CR
+from SupportClasses import XYTopSpeed as TS
 
 try:
     import cv2
@@ -68,6 +72,12 @@ except Exception:  # pragma: no cover
     CameraRole = None
 
 logger = logging.getLogger(__name__)
+
+
+def _mmss(seconds: float) -> str:
+    """m:ss for the run clock. Negative/absent reads as 0:00."""
+    t = max(0, int(round(float(seconds or 0.0))))
+    return "%d:%02d" % (t // 60, t % 60)
 
 _LOG_DIR = Path("logs/timing")
 
@@ -206,12 +216,15 @@ class _EncoderMotion:
 
 @dataclass
 class _TimingConfig:
-    max_segments: int
-    seg_len_mm: float
+    # v7.21.2: `max_segments` / `seg_len_mm` described the settle-delay sweep,
+    # which is gone. They keep defaults rather than being deleted so the legacy
+    # top-speed worker and its tests still construct a config unchanged.
     speed_mm_s: float
     repeats: int
     still_window_s: float
     top_max_dist_mm: float = 10.0
+    max_segments: int = 8
+    seg_len_mm: float = 1.0
 
 
 # ── Live frame-change strip ───────────────────────────────────────────
@@ -416,6 +429,8 @@ class _TimingBridge(QObject):
     motion = Signal(float, float)        # t_rel, change
     marker = Signal(float, str)          # t_rel, kind ('cmd' | 'still')
     result = Signal(dict)                # points, slope, intercept, labels
+    # v7.21.2: one StepProgress per phase boundary of the single calibration.
+    step = Signal(object)
 
 
 class TimingCalibrationWorkflowPage(QWidget):
@@ -456,6 +471,7 @@ class TimingCalibrationWorkflowPage(QWidget):
         self._bridge.motion.connect(self._on_motion)
         self._bridge.marker.connect(self._on_marker)
         self._bridge.result.connect(self._on_result)
+        self._bridge.step.connect(self._on_step)
 
         # Comprehensive settings popout (scrollable, saveable timing presets).
         self._settings_dialog = WorkflowSettingsDialog(
@@ -469,6 +485,14 @@ class TimingCalibrationWorkflowPage(QWidget):
         outer.addLayout(self._build_header())
         outer.addWidget(self._build_main_area(), stretch=1)
         outer.addWidget(self._build_run_row())
+        # v7.21: a section moved out of ⚙ Settings lands in the drawer, which is
+        # hidden (zero footprint) until something is in it. AFTER the run row on
+        # purpose, so Start / Abort never move.
+        self._promoted_panel = PromotedSectionsPanel()
+        outer.addWidget(self._promoted_panel)
+        self._layout_store = wire_section_promotion(
+            self, self._settings_dialog, self._promoted_panel.stack,
+            settings=self._settings, workflow_id="timing_calibration")
         self._update_button_state()
         self._settings_dialog.load_last()
         self._update_settings_summary()
@@ -512,14 +536,23 @@ class TimingCalibrationWorkflowPage(QWidget):
         self._update_settings_summary()
 
     def _update_settings_summary(self):
+        """v7.21.2: summarise the CALIBRATION TARGET.
+
+        This used to read ``_spin_maxn``/``_spin_seg`` inside a bare ``except:
+        pass`` — with the settle sweep gone those attributes no longer exist, and
+        the swallowed AttributeError would have left the summary permanently blank
+        with nothing to explain why.
+        """
         if not hasattr(self, "_settings_summary"):
             return
         try:
+            n = _CR.GRID_LEVELS.get(self._grid_level(), 7)
             self._settings_summary.setText(
-                f"N≤{self._spin_maxn.value()} · seg {self._spin_seg.value():g} mm "
-                f"· {self._spin_speed.value():g} mm/s")
-        except Exception:
-            pass
+                f"≤{self._spin_speed.value():g} mm/s · "
+                f"{self._spin_res_um.value():g} µm element · "
+                f"{self._spin_feature_mm.value():g} mm star · grid {n}×{n}")
+        except Exception as e:
+            logger.debug("settings summary refresh failed: %s", e)
 
     @staticmethod
     def _dspin(lo, hi, val, suffix="", decimals=2, step=None, tip=""):
@@ -545,39 +578,74 @@ class TimingCalibrationWorkflowPage(QWidget):
         return sb
 
     def _build_settings_dialog(self, dlg: WorkflowSettingsDialog):
-        # ── Settle-delay sweep ──
-        self._spin_maxn = self._ispin(
-            1, 40, 8,
-            "Sweeps N = 1, 2, … up to this. The delay's growth across N is the "
-            "per-segment phase lag.")
-        self._spin_maxn.valueChanged.connect(
-            lambda *_: self._update_settings_summary())
-        self._spin_seg = self._dspin(0.1, 10.0, 1.0, " mm", 2, 0.1)
-        self._spin_seg.valueChanged.connect(
-            lambda *_: self._update_settings_summary())
+        # ── What the calibration is aiming at ──
+        # v7.21.2: these replace the settle-sweep knobs. `_spin_speed` keeps its
+        # attribute name (several tests and the settings profile reference it) but
+        # has a real new job: it is the target speed the derivation and the grid
+        # aim for — a CEILING, since the achievable speed is an output of the run.
         self._spin_speed = self._dspin(0.1, 50.0, 5.0, " mm/s", 2, 0.5)
+        self._spin_speed.setToolTip(
+            "The fastest you want to print. The calibration reports what this "
+            "machine can actually hold on the test feature, which is usually "
+            "lower — the dead time and the feature's corners set the real limit.")
         self._spin_speed.valueChanged.connect(
             lambda *_: self._update_settings_summary())
+        self._spin_res_um = self._dspin(
+            1.0, 500.0, 30.0, " µm", 0, 5.0,
+            "Resolution element — how far the printed path may stray before a "
+            "tuning counts as failing. Near this machine's physical floor there "
+            "is nothing to gain by asking for less.")
+        self._spin_res_um.valueChanged.connect(
+            lambda *_: self._update_settings_summary())
+        self._spin_feature_mm = self._dspin(
+            0.5, 20.0, 2.0, " mm", 1, 0.5,
+            "Size of the test star. Small features are the hard case: their "
+            "corners demand a short lookahead, which is what limits the speed.")
+        self._spin_feature_mm.valueChanged.connect(
+            lambda *_: self._update_settings_summary())
+        sec = dlg.add_section("Calibration target")
+        sec.add("speed", "Target print speed", self._spin_speed, 5.0)
+        sec.add("res_um", "Resolution element", self._spin_res_um, 30.0)
+        sec.add("feature_mm", "Test feature size", self._spin_feature_mm, 2.0)
+
+        # ── Probes ──
         self._spin_reps = self._ispin(
-            1, 10, 2, "Average this many runs per N (less noise).")
+            1, 10, 2, "Timed moves per distance in the top-speed sweep.")
         self._spin_still = self._dspin(
             0.1, 2.0, 0.35, " s", 2, 0.05,
-            "Frames must stay unchanged this long to count as 'stopped'.")
-        sec = dlg.add_section("Settle-delay sweep")
-        sec.add("maxn", "Max segments (N)", self._spin_maxn, 8)
-        sec.add("seg", "Segment length", self._spin_seg, 1.0)
-        sec.add("speed", "Print speed", self._spin_speed, 5.0)
-        sec.add("reps", "Repeats / N", self._spin_reps, 2)
-        sec.add("still", "Still window", self._spin_still, 0.35)
-
-        # ── Top-speed measurement ──
+            "Motion must stay below threshold this long to count as 'stopped'.")
         self._spin_topdist = self._dspin(
             1.0, 50.0, 10.0, " mm", 1, 1.0,
-            "Measure-top-speed sweeps move distances up to this at full speed; "
-            "the time-vs-distance slope = 1/top-speed. Bigger = more accurate "
-            "(needs envelope room + a textured view along +X).")
-        sec = dlg.add_section("Top-speed measurement")
+            "The top-speed sweep moves distances up to this at full speed; the "
+            "time-vs-distance slope = 1/top-speed. Bigger = more accurate, and "
+            "it is shrunk automatically to stay clear of the travel limits.")
+        self._detector_combo = QComboBox()
+        self._detector_combo.addItem("Stage position (no camera)", "encoder")
+        self._detector_combo.addItem("Microscope camera", "camera")
+        self._detector_combo.setToolTip(
+            "How stage motion / stillness is measured.\n"
+            "Stage position = poll the Prior's own reported position (camera-"
+            "free; rest ≈ 0 µm, motion ≈ hundreds of µm per poll).\n"
+            "Microscope camera = frame-difference (needs a well-textured, "
+            "in-focus, well-lit view).")
+        self._detector_combo.setMinimumWidth(s(170))
+        sec = dlg.add_section("Probes")
         sec.add("topdist", "Top-speed max distance", self._spin_topdist, 10.0)
+        sec.add("reps", "Repeats per distance", self._spin_reps, 2)
+        sec.add("still", "Still window", self._spin_still, 0.35)
+        sec.add_widget(self._detector_combo)
+
+        # ── Diagnostics ──
+        # The bench moved off the run row but must stay REACHABLE, or
+        # `_open_challenge` becomes dead code and the only manual path-following
+        # tool in the app is unreachable.
+        sec = dlg.add_section("Diagnostics")
+        self._challenge_btn = QPushButton("XY Printing Challenge…")
+        self._challenge_btn.setToolTip(
+            "Bench: drive challenge shapes manually and compare actual vs ideal "
+            "path. Diagnostic only — the calibration does the tuning.")
+        self._challenge_btn.clicked.connect(self._open_challenge)
+        sec.add_widget(self._challenge_btn)
 
         # ── Start location ──
         sec = dlg.add_section("Start location")
@@ -742,55 +810,72 @@ class TimingCalibrationWorkflowPage(QWidget):
         return card
 
     def _build_run_row(self) -> QFrame:
+        """ONE action.
+
+        v7.21.2: this row used to carry four probe buttons — Start sweep, Measure
+        top speed, Check comms rate — plus the Challenge bench, whose ORDER was
+        load-bearing and undocumented (every later one consumes an earlier
+        measurement). The whole sequence is now a single button; the detector, the
+        calibration targets and the bench moved into the ⚙ Settings popout, which
+        is where a rarely-changed choice belongs.
+        """
         frame = QFrame(self)
         row = QHBoxLayout(frame)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(s(10))
-        # Detector: how "the stage has stopped moving" is sensed. Default =
-        # the stage's OWN reported position (no camera needed) — the right
-        # choice when the microscope isn't a good motion sensor on this rig.
-        row.addWidget(QLabel("Detector:"))
-        self._detector_combo = QComboBox()
-        self._detector_combo.addItem("Stage position (no camera)", "encoder")
-        self._detector_combo.addItem("Microscope camera", "camera")
-        self._detector_combo.setToolTip(
-            "How stage motion / stillness is measured.\n"
-            "Stage position = poll the Prior's own reported position (camera-"
-            "free; rest ≈ 0 µm, motion ≈ hundreds of µm per poll).\n"
-            "Microscope camera = frame-difference (needs a well-textured, "
-            "in-focus, well-lit view).")
-        self._detector_combo.setMinimumWidth(s(170))
-        row.addWidget(self._detector_combo)
-        self._start_btn = QPushButton("Start sweep")
-        self._start_btn.setToolTip(
-            "Segment settle-delay sweep — measures the per-segment phase lag.")
-        self._start_btn.clicked.connect(self._on_start)
-        row.addWidget(self._start_btn)
-        self._speed_btn = QPushButton("Measure top speed")
-        self._speed_btn.setToolTip(
-            "Sweep move distance at FULL speed; the time-vs-distance slope = "
-            "1/top-speed. Stores it so the mm/s↔SMS conversion is correct "
-            "(makes commanded speed real). Do this FIRST.")
-        self._speed_btn.clicked.connect(self._on_measure_speed)
-        row.addWidget(self._speed_btn)
-        self._comms_btn = QPushButton("Check comms rate")
-        self._comms_btn.setToolTip(
-            "Measure the closed-loop control cadence WHILE the stage is moving "
-            "(send-velocity + read-position per cycle). This is the loop rate "
-            "the velocity-following print can run at — it sets the max stable "
-            "print speed. Needle stays retracted; net motion ~0.")
-        self._comms_btn.clicked.connect(self._on_check_comms)
-        row.addWidget(self._comms_btn)
+
+        row.addWidget(QLabel("Grid:"))
+        self._grid_combo = QComboBox()
+        for key in _CR.GRID_LEVEL_ORDER:
+            self._grid_combo.addItem(_CR.GRID_LEVEL_LABELS[key], key)
+        self._grid_combo.setCurrentIndex(_CR.GRID_LEVEL_ORDER.index("medium"))
+        self._grid_combo.setToolTip(
+            "How finely the tuning grid is searched (lookahead x corner speed).\n"
+            "Candidates are scored in SIMULATION against this machine's measured "
+            "dynamics, so even the finest grid costs seconds, not minutes — the "
+            "coarseness trades how precisely the fastest usable lookahead is "
+            "located, not how long the stage moves.")
+        self._grid_combo.setMinimumWidth(s(180))
+        row.addWidget(self._grid_combo)
+
+        self._run_btn = QPushButton("Run XY Calibration")
+        self._run_btn.setToolTip(
+            "Measure this stage and tune the print follower in one pass:\n"
+            "  1. comms rate (closed-loop cadence while moving)\n"
+            "  2. dead time (command to motion transport delay)\n"
+            "  3. top speed (distance sweep at full speed)\n"
+            "  4. apply the measured top speed everywhere\n"
+            "  5. derive the follower settings in closed form\n"
+            "  6. tune on a simulated grid, then verify on the stage\n"
+            "The needle stays retracted throughout and the stage is centred "
+            "first, so no probe can reach a travel limit. Under three minutes.")
+        self._run_btn.clicked.connect(self._on_run_calibration)
+        row.addWidget(self._run_btn)
+
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._on_stop)
         row.addWidget(self._stop_btn)
-        self._challenge_btn = QPushButton("XY Printing Challenge…")
-        self._challenge_btn.setToolTip(
-            "Open the path-following bench: drive challenge shapes in each print "
-            "mode, compare actual vs ideal path, and tune per-mode parameters.")
-        self._challenge_btn.clicked.connect(self._open_challenge)
-        row.addWidget(self._challenge_btn)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedWidth(s(140))
+        row.addWidget(self._progress)
+
+        self._step_label = QLabel("")
+        self._step_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(10)}pt;")
+        self._step_label.setMinimumWidth(s(160))
+        row.addWidget(self._step_label)
+
+        self._clock_label = QLabel("")
+        self._clock_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(10)}pt;")
+        self._clock_label.setMinimumWidth(s(150))
+        row.addWidget(self._clock_label)
+
         row.addStretch(1)
         self._status = QLabel("")
         self._status.setStyleSheet(
@@ -1023,19 +1108,19 @@ class TimingCalibrationWorkflowPage(QWidget):
         running = self._running()
         connected = (getattr(self._controller, "is_xy_connected", False)
                      and getattr(self._controller, "is_zp_connected", False))
-        self._start_btn.setEnabled(connected and not running)
-        if hasattr(self, "_speed_btn"):
-            self._speed_btn.setEnabled(connected and not running)
-        if hasattr(self, "_comms_btn"):
-            # comms probe only needs the XY stage (ZP only to confirm retract)
-            xy_ok = getattr(self._controller, "is_xy_connected", False)
-            self._comms_btn.setEnabled(xy_ok and not running)
+        if hasattr(self, "_run_btn"):
+            self._run_btn.setEnabled(connected and not running)
+        if hasattr(self, "_start_btn"):
+            self._start_btn.setEnabled(connected and not running)
         self._stop_btn.setEnabled(running)
 
     def _gather_config(self) -> _TimingConfig:
+        """Probe knobs for the legacy top-speed worker + the preflight.
+
+        ``max_segments`` / ``seg_len_mm`` keep their dataclass defaults now that the
+        settle-delay sweep is gone — they described that sweep alone.
+        """
         return _TimingConfig(
-            max_segments=int(self._spin_maxn.value()),
-            seg_len_mm=float(self._spin_seg.value()),
             speed_mm_s=float(self._spin_speed.value()),
             repeats=int(self._spin_reps.value()),
             still_window_s=float(self._spin_still.value()),
@@ -1093,12 +1178,89 @@ class TimingCalibrationWorkflowPage(QWidget):
         self._thread.start()
         self._update_button_state()
 
-    def _on_start(self):
+    # ── v7.21.2: the ONE calibration ──────────────────────────────
+
+    def _grid_level(self) -> str:
+        combo = getattr(self, "_grid_combo", None)
+        if combo is None:
+            return "medium"
+        return str(combo.currentData() or "medium")
+
+    def _calibration_request(self):
+        """Build the request from the popout's targets + the run row's grid."""
+        def _val(attr, default):
+            w = getattr(self, attr, None)
+            try:
+                return float(w.value()) if w is not None else default
+            except Exception:
+                return default
+        return _CR.CalibrationRequest(
+            target_speed_mm_s=_val("_spin_speed", 5.0),
+            resolution_um=_val("_spin_res_um", 30.0),
+            grid_level=self._grid_level(),
+            feature_mm=_val("_spin_feature_mm", 2.0),
+            safe_z_mm=self._safe_z,
+            top_speed_max_dist_mm=_val("_spin_topdist", 10.0),
+            top_speed_repeats=int(_val("_spin_reps", 2)),
+        )
+
+    def _on_run_calibration(self):
         if self._running():
             return
         cfg = self._preflight()
-        if cfg is not None:
-            self._launch(self._run, cfg, "Segment settle-delay sweep running…")
+        if cfg is None:
+            return
+        self._launch(self._run_calibration, self._calibration_request(),
+                     "XY calibration running…")
+
+    def _run_calibration(self, request) -> None:
+        """Worker: the whole calibration, start to finish.
+
+        All the sequencing, safety and scoring lives in the GUI-free
+        ``XYCalibrationRun`` module — this method only relays progress and the
+        final summary, so the same run is testable without Qt.
+        """
+        def _on_step(step):
+            self._bridge.step.emit(step)
+            if step.message:
+                self._log_t(f"{step.title}: {step.message}")
+        try:
+            res = _CR.run_calibration(
+                self._controller, settings=self._settings, store=get_store(),
+                request=request, stop_evt=self._stop, on_progress=_on_step)
+            ts = res.top_speed_fit or {}
+            if res.top_speed_um_s and ts:
+                try:
+                    TS.write_jsonl({**ts, "top_speed_um_s": res.top_speed_um_s,
+                                    "rows": [], "distances_mm": []}, _LOG_DIR)
+                except Exception:
+                    pass
+            if res.grid is not None and res.grid.best is not None:
+                self._bridge.stats.emit({
+                    "top": f"{res.top_speed_um_s / 1000.0:.2f} mm/s",
+                    "cap": f"{res.grid.resolved_cap_mm_s:.2f} mm/s",
+                    "la": f"{res.grid.best.lookahead_mm:.3f} mm",
+                    "p95": f"{res.grid.best.p95_um:.0f} µm"})
+            self._bridge.finished.emit(bool(res.ok), res.summary or res.error)
+        except Exception as e:                                # pragma: no cover
+            logger.exception("XY calibration failed")
+            self._bridge.finished.emit(False, f"Error: {e}")
+
+    def _on_step(self, step) -> None:
+        """GUI thread: render one phase boundary."""
+        try:
+            idx = _CR.STEP_ORDER.index(step.step) + 1
+        except ValueError:
+            idx = 0
+        n = len(_CR.STEP_ORDER)
+        done = idx - (0 if step.state in ("done", "skipped") else 1)
+        if hasattr(self, "_progress"):
+            self._progress.setValue(int(100.0 * max(0, done) / n))
+        if hasattr(self, "_step_label"):
+            self._step_label.setText(f"{idx}/{n} · {step.title}")
+        if hasattr(self, "_clock_label"):
+            self._clock_label.setText(
+                f"{_mmss(step.elapsed_s)} elapsed · ~{_mmss(step.remaining_s)} left")
 
     def _on_measure_speed(self):
         if self._running():
@@ -1340,175 +1502,6 @@ class TimingCalibrationWorkflowPage(QWidget):
 
     # ── worker thread ─────────────────────────────────────────────
 
-    def _run(self, cfg: _TimingConfig) -> None:
-        ctrl = self._controller
-        center = self._resolve_start_mm()
-        if center is None:
-            self._bridge.finished.emit(False, "No start location — aborted.")
-            return
-        tracker = self._make_tracker()
-        if not tracker.available():
-            self._bridge.finished.emit(
-                False, "Motion detector unavailable — connect the XY stage "
-                "(stage-position detector) or start the microscope (camera "
-                "detector).")
-            return
-
-        cx, cy = center
-        seg = (cfg.seg_len_mm, 0.0)               # straight line along +X
-        seg_time = cfg.seg_len_mm / max(cfg.speed_mm_s, 0.01)
-        had_poller = hasattr(ctrl, "suspend_position_poller")
-        had_wd = hasattr(ctrl, "suspend_zp_watchdog")
-        ok = True
-        summary = ""
-        rows: list[dict] = []
-        self._log_t(
-            f"Settle-delay sweep: N=1..{cfg.max_segments} × {cfg.repeats} "
-            f"reps · seg {cfg.seg_len_mm:.2f}mm @ {cfg.speed_mm_s:.2f}mm/s "
-            f"(seg time {seg_time * 1000:.0f}ms). Needle retracted.")
-        try:
-            if hasattr(ctrl, "ensure_retracted_to") and self._safe_z is not None:
-                ctrl.ensure_retracted_to(float(self._safe_z))
-            if self._stop.is_set():
-                self._bridge.finished.emit(False, "Stopped before start.")
-                return
-            xy = getattr(ctrl, "xy_stage", None)
-            if xy is not None:
-                # Set acceleration too — short segments are accel-dominated, and
-                # an unset/low Prior accel makes moves far slower than
-                # seg_len/speed implies (a confounder for this very measurement).
-                if hasattr(xy, "set_acceleration"):
-                    try:
-                        xy.set_acceleration(80)
-                    except Exception:
-                        pass
-                if hasattr(xy, "set_speed_mm_s"):
-                    try:
-                        xy.set_speed_mm_s(cfg.speed_mm_s)
-                    except Exception:
-                        pass
-            if had_poller:
-                ctrl.suspend_position_poller()
-            if had_wd:
-                ctrl.suspend_zp_watchdog()
-
-            # Threshold: a physical detector (the stage-position encoder) uses a
-            # FIXED µm threshold — its metric is absolute distance, so no scene
-            # calibration is needed (and scene calibration is what made this
-            # sweep fail on short segments). The camera derives it from the scene
-            # via a test move.
-            _fixed = getattr(tracker, "fixed_threshold", None)
-            if _fixed is not None:
-                floor, peak, still_thresh = self._encoder_threshold(
-                    ctrl, tracker, cx, cy)
-                self._log_t(
-                    f"Stage-position detector: rest jitter {floor:.1f} → still "
-                    f"threshold {still_thresh:.1f} µm/poll (no scene calibration).")
-            else:
-                cal = self._calibrate_threshold(
-                    ctrl, tracker, cx, cy, seg, seg_time)
-                if cal is None:
-                    self._bridge.finished.emit(
-                        False, "No camera frames — is the microscope running?")
-                    return
-                floor, peak, still_thresh = cal
-                self._log_t(
-                    f"Calibration: rest noise {floor:.2f}, motion peak "
-                    f"{peak:.2f} → still threshold {still_thresh:.2f}.")
-                # If a real move doesn't move the frames clearly above the rest
-                # noise, the camera can't see the motion — abort with guidance
-                # rather than report a bogus 0 ms.
-                if (peak - floor) < max(floor * 0.5, 0.5):
-                    self._bridge.finished.emit(
-                        False, f"Camera not detecting stage motion (rest "
-                        f"{floor:.2f} ≈ move {peak:.2f}) — check the microscope "
-                        f"is focused on a TEXTURED region, well-lit, and running "
-                        f"at a usable FPS.")
-                    return
-            self._strip.set_threshold(still_thresh)
-            self._bridge.stats.emit({"thresh": f"{still_thresh:.2f}"})
-
-            for n in range(1, cfg.max_segments + 1):
-                if self._stop.is_set():
-                    break
-                delays = []
-                for rep in range(cfg.repeats):
-                    if self._stop.is_set():
-                        break
-                    d = self._measure_n(ctrl, tracker, (cx, cy), seg, n,
-                                        seg_time, still_thresh,
-                                        cfg.still_window_s)
-                    if d is not None:
-                        delays.append(d)
-                if not delays:
-                    self._log_t(f"  N={n}: no stop detected (timeout).")
-                    continue
-                avg = sum(delays) / len(delays)
-                rows.append({"N": n, "delay_s": avg, "reps": len(delays),
-                             "delays_s": [round(x, 4) for x in delays]})
-                self._bridge.stats.emit({"seg": n, "delay": f"{avg * 1000:.0f}"})
-                self._log_t(f"  N={n}: settle delay {avg * 1000:.0f} ms "
-                            f"(n={len(delays)})")
-
-            # Fit delay vs N → slope (per-segment phase lag) + intercept.
-            pts = [(r["N"], r["delay_s"]) for r in rows]
-            slope, intercept = _fit_line(pts)
-
-            self._bridge.result.emit({
-                "points": pts, "slope": slope, "intercept": intercept,
-                "headline": (f"phase lag {slope * 1000:.1f} ms/segment "
-                             f"(base {intercept * 1000:.0f} ms)"),
-                "xlabel": "segments →", "ylabel": "delay (ms)"})
-            self._log_t("──── RESULT ────")
-            if len(pts) >= 2:
-                self._log_t(
-                    f"phase lag = {slope * 1000:.1f} ms PER SEGMENT "
-                    f"(base settle {intercept * 1000:.0f} ms). Over an M-segment "
-                    f"print the stage ends ≈{intercept * 1000:.0f} + "
-                    f"{slope * 1000:.1f}·M ms behind the commands.")
-                summary = (f"phase lag {slope * 1000:.1f} ms/segment · "
-                           f"base {intercept * 1000:.0f} ms · {len(pts)} points")
-            else:
-                summary = f"{len(pts)} point(s) — need ≥2 N for a slope"
-                self._log_t(summary)
-
-            try:
-                entry = get_store().update_phase(
-                    cfg.speed_mm_s, cfg.seg_len_mm, intercept, slope,
-                    len(pts))
-                self._log_t(f"Saved (run #{entry.get('runs')}).")
-            except Exception as e:
-                self._log_t(f"Store update failed: {e}")
-            self._write_jsonl(cfg, seg_time, rows, slope, intercept)
-        except Exception as e:
-            logger.exception("Timing calibration worker error: %s", e)
-            self._log_t(f"⚠ Worker error: {e}")
-            ok = False
-            summary = f"error: {e}"
-        finally:
-            if had_poller:
-                try:
-                    ctrl.resume_position_poller()
-                except Exception:
-                    pass
-            if had_wd:
-                try:
-                    ctrl.resume_zp_watchdog()
-                except Exception:
-                    pass
-            try:
-                if (getattr(ctrl, "is_zp_connected", False)
-                        and self._safe_z is not None
-                        and hasattr(ctrl, "ensure_retracted_to")):
-                    ctrl.ensure_retracted_to(float(self._safe_z))
-            except Exception as e:
-                logger.warning("Timing final retract failed: %s", e)
-
-        if self._stop.is_set() and not summary:
-            summary = "Stopped by operator."
-            ok = False
-        self._bridge.finished.emit(ok, summary or "done")
-
     def _run_top_speed(self, cfg: _TimingConfig) -> None:
         """Measure the stage's TRUE top speed: at FULL speed (SMS,100), sweep
         single-move distances and time each to stillness; the time-vs-distance
@@ -1732,27 +1725,6 @@ class TimingCalibrationWorkflowPage(QWidget):
             return None
         self._bridge.marker.emit(self._rel(t_still), "still")
         return max(0.0, t_still - t_last)
-
-    def _write_jsonl(self, cfg, seg_time, rows, slope, intercept):
-        try:
-            _LOG_DIR.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = _LOG_DIR / f"settle_{stamp}_{cfg.speed_mm_s:.1f}mmps.jsonl"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "event": "config", "kind": "settle_delay_sweep",
-                    "max_segments": cfg.max_segments,
-                    "seg_len_mm": cfg.seg_len_mm, "speed_mm_s": cfg.speed_mm_s,
-                    "seg_time_s": round(seg_time, 5), "repeats": cfg.repeats,
-                    "still_window_s": cfg.still_window_s}) + "\n")
-                for r in rows:
-                    f.write(json.dumps({"event": "point", **r}) + "\n")
-                f.write(json.dumps({
-                    "event": "fit", "slope_s_per_seg": round(slope, 6),
-                    "intercept_s": round(intercept, 5)}) + "\n")
-            self._log_t(f"Sweep written to {path}")
-        except Exception as e:
-            self._log_t(f"JSONL write failed: {e}")
 
 
 def _fit_line(points: list) -> tuple:

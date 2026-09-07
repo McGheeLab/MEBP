@@ -421,52 +421,26 @@ class XYChallengeDialog(QDialog):
         root.addLayout(mid, stretch=1)
 
         # Buttons
+        #
+        # v7.21.2: this dialog is now a BENCH DIAGNOSTIC, not a tuning surface.
+        # Calibrate / Compare / Auto-tune (descent) / Auto-tune PID (ZN) /
+        # Robustness / PID from dead time / Measure dead time / Save tuned params
+        # are gone: every one of them measured or wrote part of the calibration on
+        # its own, in an order that mattered and was not enforced, and the
+        # coordinate descent additionally optimised `path_error` — a one-sided,
+        # untimed metric its own docstring forbids as an auto-tune objective, under
+        # which a crawling run scores best. That is why the stored tuning ended up
+        # at the minimum of BOTH its grids. All of it now lives in one place:
+        # Workflows -> XY<->ZP Timing Calibration -> Run XY Calibration.
+        #
+        # `Save tuned params` is deliberately gone too: a bench dialog that can
+        # hand-overwrite the calibrated tuning is exactly how two homes for these
+        # numbers drifted apart.
         row = QHBoxLayout()
-        self._calibrate_btn = QPushButton("⚙ Calibrate XY (one click)")
-        self._calibrate_btn.setToolTip(
-            "Measure the comms rate, dead time and top speed, DERIVE every "
-            "follower parameter from them in closed form, verify on real shapes, "
-            "and apply the result to every print.\n\n"
-            "The stage is centred in its travel envelope first and every probe "
-            "excursion is checked to fit, so no test can reach a travel limit. "
-            "Needle stays retracted at Safe Z throughout (XY only).")
-        self._calibrate_btn.clicked.connect(lambda: self._launch("calibrate"))
         self._run_btn = QPushButton("Run")
         self._run_btn.setToolTip("Drive the shape in the selected mode; overlay "
                                  "actual vs ideal + report deviation.")
         self._run_btn.clicked.connect(lambda: self._launch("run"))
-        self._cmp_btn = QPushButton("Compare all modes")
-        self._cmp_btn.clicked.connect(lambda: self._launch("compare"))
-        self._tune_btn = QPushButton("Auto-tune (descent)")
-        self._tune_btn.setToolTip("Coordinate-descent over the selected mode's "
-                                  "key parameters; keep the lowest-deviation set.")
-        self._tune_btn.clicked.connect(lambda: self._launch("tune"))
-        self._zn_btn = QPushButton("Auto-tune PID (ZN)")
-        self._zn_btn.setToolTip("[velocity] Ziegler–Nichols relay test → cross-"
-                                "track PID gains.")
-        self._zn_btn.clicked.connect(lambda: self._launch("zn"))
-        self._robust_btn = QPushButton("Robustness panel")
-        self._robust_btn.setToolTip("[velocity] Sweep shapes × sizes × speeds; "
-                                    "PASS/FAIL each vs the resolution element.")
-        self._robust_btn.clicked.connect(lambda: self._launch("robust"))
-        self._pid_calc_btn = QPushButton("PID from dead time")
-        self._pid_calc_btn.setToolTip(
-            "Derive the cross-track gains ANALYTICALLY from the measured dead "
-            "time — the plant is a pure integrator plus delay, so Ku = π/(2L) and "
-            "Tu = 4L exactly. Instant, no stage motion, and identical every time "
-            "you press it (the relay experiment is not).")
-        self._pid_calc_btn.clicked.connect(lambda: self._launch("pid_calc"))
-        self._deadtime_btn = QPushButton("Measure dead time")
-        self._deadtime_btn.setToolTip(
-            "Step the velocity command and time the position response → the "
-            "REAL command→motion dead time (no camera). This is what caps the "
-            "print speed; the legacy by_phase settle-time average currently "
-            "throttles this machine to a fraction of its measured top speed.")
-        self._deadtime_btn.clicked.connect(lambda: self._launch("deadtime"))
-        self._save_btn = QPushButton("Save tuned params")
-        self._save_btn.setToolTip("Persist the current parameters so the real "
-                                  "print uses them.")
-        self._save_btn.clicked.connect(self._save_params_to_store)
         self._geometry_btn = QPushButton("📐 Geometry panel…")
         self._geometry_btn.setToolTip(
             "Ideal vs actual per shape × size — simulated from the measured "
@@ -476,10 +450,7 @@ class XYChallengeDialog(QDialog):
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(lambda: self._stop.set())
-        for b in (self._calibrate_btn, self._run_btn, self._cmp_btn,
-                  self._tune_btn, self._zn_btn, self._pid_calc_btn,
-                  self._robust_btn, self._deadtime_btn, self._save_btn,
-                  self._geometry_btn, self._stop_btn):
+        for b in (self._run_btn, self._geometry_btn, self._stop_btn):
             row.addWidget(b)
         row.addStretch(1)
         root.addLayout(row)
@@ -508,10 +479,9 @@ class XYChallengeDialog(QDialog):
         shown = set(MODE_PARAMS.get(mode, []))
         for name, row in self._param_rows.items():
             row.setVisible(name in shown)
-        # ZN + robustness only meaningful for the closed-loop velocity mode
-        is_vel = (mode == "velocity")
-        self._zn_btn.setEnabled(is_vel and not self._busy())
-        self._robust_btn.setEnabled(is_vel and not self._busy())
+        # v7.21.2: the ZN + robustness buttons are gone (their work moved into
+        # the one XY calibration). Referencing them here would break dialog
+        # CONSTRUCTION, since this runs from __init__ as well as the mode combo.
 
     def _append_log(self, msg):
         self._log.appendPlainText(msg)
@@ -658,24 +628,15 @@ class XYChallengeDialog(QDialog):
         self._log.clear()
         self._overlay.clear()
         self._set_running(True)
-        target = {"run": self._worker_run, "compare": self._worker_compare,
-                  "tune": self._worker_tune, "zn": self._worker_zn,
-                  "robust": self._worker_robustness,
-                  "deadtime": self._worker_deadtime,
-                  "pid_calc": self._worker_pid_analytic,
-                  "calibrate": self._worker_calibrate_all}[action]
+        # v7.21.2: only the manual bench run survives here.
+        target = {"run": self._worker_run}[action]
         self._thread = threading.Thread(target=target, name="XYChallenge",
                                         daemon=True)
         self._thread.start()
 
     def _set_running(self, on):
-        for b in (self._calibrate_btn, self._run_btn, self._cmp_btn,
-                  self._tune_btn, self._save_btn, self._deadtime_btn,
-                  self._pid_calc_btn):
+        for b in (self._run_btn, self._geometry_btn):
             b.setEnabled(not on)
-        is_vel = (self._mode_combo.currentData() == "velocity")
-        self._zn_btn.setEnabled(is_vel and not on)
-        self._robust_btn.setEnabled(is_vel and not on)
         self._stop_btn.setEnabled(on)
         if not on:
             self.refresh_budget()

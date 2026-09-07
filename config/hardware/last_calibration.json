@@ -1,8 +1,8 @@
 {
   "version": "1.0",
-  "saved_at": "2026-08-13T13:34:11",
+  "saved_at": "2026-08-13T15:29:42",
   "fingerprint": {
-    "device": "ME3B_2",
+    "device": "ME3B_01",
     "axis_map": {
       "Z": "Z",
       "P1": "X",
@@ -10,18 +10,18 @@
       "P3": "E"
     },
     "steps_per_mm": {
-      "Z": 5069,
-      "P1": 5069,
-      "P2": -5069,
-      "P3": 5069
+      "Z": 5069.0,
+      "P1": 5069.0,
+      "P2": -5069.0,
+      "P3": 5069.0
     },
     "plate_format": 24,
     "needle_gauge": null,
-    "needle_type": "pulled_capillary",
-    "needle_bore_um": 500.0,
-    "needle_tip_length_mm": 5.0,
+    "needle_type": null,
+    "needle_bore_um": null,
+    "needle_tip_length_mm": null,
     "needle_form": null,
-    "needle_bore_count": 1,
+    "needle_bore_count": null,
     "plate_flip_180": null
   },
   "zero_position": {
@@ -34,7 +34,7 @@
     "P3": 0.0
   },
   "calibration": {
-    "plate_format": "custom:A4_R_nest-plastic-24",
+    "plate_format": 24,
     "taught_a1": [
       104834.54634130462,
       67179.13788674142
@@ -67,11 +67,11 @@
     "plate_bottom_z_source": "taught",
     "plate_flip_180": true,
     "mosaic_affine": {
-      "rotation_deg": 5.852927940686754e-12,
+      "rotation_deg": 5.85298867677533e-12,
       "scale": 0.999999999999929,
       "translation_um": [
-        31.475109840577943,
-        75.3772686536738
+        31.475109840578224,
+        75.37726865367293
       ],
       "center_um": [
         0.0,

@@ -375,6 +375,17 @@ class VideoRecordingSettingsDialog(_CaptureSettingsBase):
         self._max_s.setRange(0, 86400)
         self._max_s.setSuffix(" s")
         self._max_s.setSpecialValueText("no limit")
+        # v7.21.8: defaults to "no limit". The old 600 s default stopped a
+        # recording ten minutes in with nothing on screen having said it would,
+        # so the tooltip now states both what 0 means and what still stops a
+        # runaway recording — otherwise "no limit" reads as "fills the disk".
+        self._max_s.setToolTip(
+            "Stop the recording after this long. 0 = “no limit”, which is the "
+            "default — a recording runs until you press ⏺ again.\n\n"
+            "A forgotten recording is still bounded: the size limit below stops "
+            "it, and that is the limit that actually protects the disk (bytes "
+            "fill a disk, minutes do not). The live estimate above the buttons "
+            "shows how long your size limit is worth at these settings.")
         self._max_s.valueChanged.connect(self._refresh_preview)
         lf.addRow("After", self._max_s)
         self._max_gb = QDoubleSpinBox()
@@ -383,7 +394,12 @@ class VideoRecordingSettingsDialog(_CaptureSettingsBase):
         self._max_gb.setSuffix(" GB")
         self._max_gb.setSpecialValueText("no limit")
         self._max_gb.setToolTip(
-            "Recording stops once the file reaches this size.")
+            "Recording stops once the file reaches this size. With no time "
+            "limit set this is the guard against a forgotten recording, so "
+            "leaving it at “no limit” too means nothing stops on its own.\n\n"
+            "AVI is additionally capped at 2 GB whatever you set here: it is a "
+            "RIFF container with 32-bit offsets, and a larger file may not play "
+            "back. Choose mp4 for long recordings.")
         self._max_gb.valueChanged.connect(self._refresh_preview)
         lf.addRow("Or at", self._max_gb)
         self._interval = QDoubleSpinBox()
@@ -432,6 +448,46 @@ class VideoRecordingSettingsDialog(_CaptureSettingsBase):
     def _validate(self, cfg):
         return validate_video(cfg)
 
+    @staticmethod
+    def _runtime_note(cfg, mb_per_min: float, raw: bool) -> str:
+        """v7.21.8: "how long will this record for?" — the question the operator
+        now has to ask, since the 10-minute default is gone.
+
+        Reports whichever limit binds FIRST, because quoting a limit that is not
+        the one that will actually stop the recording is worse than quoting
+        none. The size limit is turned into MINUTES here so the two are
+        comparable at a glance; the AVI structural clamp is folded in, so the
+        number shown is the number that will happen.
+        """
+        from SupportClasses.CaptureVideoWriter import container_byte_limit
+
+        def _fmt(minutes: float) -> str:
+            if minutes >= 90:
+                return f"{minutes / 60:.1f} h"
+            return f"{minutes:.0f} min"
+
+        secs = max(0.0, float(cfg.get("video_max_seconds", 0) or 0))
+        by_bytes = max(0.0, float(cfg.get("video_max_gb", 0) or 0)) * (1024 ** 3)
+        if not raw:
+            by_bytes = container_byte_limit(
+                cfg.get("video_container", "mp4"), by_bytes)
+        clamped = (not raw and by_bytes > 0
+                   and by_bytes < max(0.0, float(cfg.get("video_max_gb", 0) or 0))
+                   * (1024 ** 3))
+
+        size_min = (by_bytes / (1024 ** 2) / mb_per_min
+                    if by_bytes > 0 and mb_per_min > 0 else 0.0)
+        time_min = secs / 60.0 if secs > 0 else 0.0
+
+        if not size_min and not time_min:
+            return ("No automatic stop — it records until you press ⏺ again, "
+                    "or the disk fills.")
+        if size_min and (not time_min or size_min <= time_min):
+            why = ("the AVI 2 GB container limit" if clamped
+                   else f"the {by_bytes / (1024 ** 3):.1f} GB limit")
+            return f"Stops after about {_fmt(size_min)} — {why}."
+        return f"Stops after {_fmt(time_min)} — the time limit."
+
     def _info(self, cfg):
         w, h = self._camera_size()
         if cfg["video_source"] == "raw_timelapse":
@@ -439,12 +495,14 @@ class VideoRecordingSettingsDialog(_CaptureSettingsBase):
             mb = estimated_video_mb_per_min(w, h, rate, "raw_timelapse")
             return (f"≈ {mb / 1024:.1f} GB per minute at {w}×{h} — every frame "
                     f"is a real 16-bit capture with its own timestamp; the "
-                    f"sequence is a time-lapse, not continuous video.")
+                    f"sequence is a time-lapse, not continuous video. "
+                    + self._runtime_note(cfg, mb, raw=True))
         mb = estimated_video_mb_per_min(w, h, cfg["video_fps"], "display",
                                         cfg["video_quality"])
         return (f"≈ {mb:.0f} MB per minute at {w}×{h}. The frame rate is the "
                 f"playback rate — a slower camera repeats frames so the video "
-                f"still runs at real time.")
+                f"still runs at real time. "
+                + self._runtime_note(cfg, mb, raw=False))
 
 
 #: v7.15 back-compat: the single dialog became two. Anything still importing

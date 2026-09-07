@@ -1,0 +1,16 @@
+{
+  "id": "capillary-750-_m-tip",
+  "display_name": "Capillary 750 \u00b5m tip",
+  "manufacturer": "",
+  "model": "",
+  "barrel_id_um": 750.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 100.0,
+  "tip_id_um": 750.0,
+  "tip_length_mm": 5.0,
+  "tip_od_um": 1000.0,
+  "tip_profile": "cylinder",
+  "puller_program": "",
+  "notes": "",
+  "builtin": false
+}

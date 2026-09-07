@@ -124,6 +124,12 @@ def run_headless(controller: StageController, settings: Settings):
     if zp_port:
         settings.set("zp_stage.last_port", zp_port)
         settings.save()
+    # v7.18.1: same for XY (protocol + port + baud), so the next launch
+    # probes once instead of scanning every protocol × baud.
+    xy_hint = controller.xy_connection_hint
+    if xy_hint:
+        settings.set("xy_stage.last_good", xy_hint)
+        settings.save()
     # v7.3.2: Load stick calibration offsets for headless mode
     _stick_offsets = settings.get_section("xbox_stick_offsets")
     if _stick_offsets:
@@ -405,6 +411,13 @@ def main():
     saved_zp_port = settings.get("zp_stage.last_port")
     if saved_zp_port:
         controller.set_preferred_zp_port(saved_zp_port)
+
+    # v7.18.1: same for XY — with controller_json="auto" the detection
+    # otherwise re-walks every protocol JSON × baud × port on EVERY
+    # connect (measured 6.8 s on ME3B_01, on the GUI thread).
+    saved_xy_hint = settings.get("xy_stage.last_good")
+    if isinstance(saved_xy_hint, dict) and saved_xy_hint:
+        controller.set_preferred_xy_hint(saved_xy_hint)
 
     # v7.3.2: Load axis flip settings
     saved_flips = settings.get_section("axis_flip")

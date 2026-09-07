@@ -1,0 +1,16 @@
+{
+  "id": "bor.-needle_-preset_-1",
+  "display_name": "Bor. Needle, Preset: 1",
+  "manufacturer": "",
+  "model": "",
+  "barrel_id_um": 500.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 100.0,
+  "tip_id_um": 125.0,
+  "tip_length_mm": 5.0,
+  "tip_od_um": 200.0,
+  "tip_profile": "cylinder",
+  "puller_program": "",
+  "notes": "",
+  "builtin": false
+}

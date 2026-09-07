@@ -1141,6 +1141,11 @@ class CameraWidget(QWidget):
                     ctrls[key] = {"range": rng}
             if tu.get_auto_exposure() is not None:
                 ctrls["auto_exposure"] = {"range": None}
+            # v7.19 — the SENSOR's own auto black/white points. Gated on a
+            # non-None getter for the same reason as every range above: a model
+            # without the capability must not be offered a dead control.
+            if tu.get_auto_levels() is not None:
+                ctrls["auto_levels"] = {"range": None}
             # Mono→8-bit display scaling: the same controls (and the same
             # historical `andor_*` keys) the Zyla uses, so both mono cameras are
             # adjusted identically during the A/B evaluation.
@@ -1239,6 +1244,23 @@ class CameraWidget(QWidget):
             # DirectShow: 0.75 = auto, 0.25 = manual.
             return bool(self._capture.set(
                 cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if enabled else 0.25))
+        return False
+
+    def set_hw_auto_levels(self, enabled: bool) -> bool:
+        """Enable/disable the camera's HARDWARE auto black/white levels.
+
+        v7.19. Only the Tucsen implements this today; every other backend
+        returns False, and the capability is advertised only where the getter
+        answers, so the settings dialog and the fluorescence preset both skip it
+        silently rather than issuing a write that does nothing.
+
+        ⚠ Distinct from ``set_hw_andor_auto_scale``, which is the SOFTWARE
+        mono16→8-bit display mapping. This one moves the sensor's own levels and
+        therefore changes captured pixel values.
+        """
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.set_auto_levels(bool(enabled))
         return False
 
     def set_hw_exposure_us(self, microseconds) -> bool:

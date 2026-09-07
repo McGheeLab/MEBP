@@ -1,0 +1,57 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "print_calibrator",
+  "name": "CMH-Cal.",
+  "saved": "2026-08-19T14:57:23",
+  "values": {
+    "pump": {
+      "text": "P1",
+      "data": null
+    },
+    "extrusion_mod": 1.0,
+    "top_speed": 2.5,
+    "resolution": 30.0,
+    "printz": 0.75,
+    "motion_mode": {
+      "text": "Velocity (closed-loop) \u2014 recommended",
+      "data": "velocity"
+    },
+    "ink": {
+      "text": "GFP, LLS",
+      "data": "GFP, LLS"
+    },
+    "ink_z": 0.5,
+    "ink_padding": 0.0,
+    "ink_prime": true,
+    "ink_prime_uL": 0.4,
+    "orbit_granular": true,
+    "orbit_all": false,
+    "orbit_dia": 1.0,
+    "orbit_speed": 2.0,
+    "prep": true,
+    "service_z": 0.5,
+    "service_z__ovr": false,
+    "buffer_needles": 0.2,
+    "buffer_needles__ovr": true,
+    "wash_cycles": 3,
+    "wash_cycles__ovr": false,
+    "line_retract": 1.0,
+    "line_z_speed": 75.0,
+    "line_xy_speed": 75.0,
+    "postclean": true,
+    "postclean_margin": 0.5,
+    "travel_speed": 7.5,
+    "preflow": 0.0,
+    "preflow__ovr": true,
+    "g_settle": 0.0,
+    "__extra__": {
+      "ink_map_last": {},
+      "print_queue": {
+        "schema": 1,
+        "prints": []
+      },
+      "queue_group_by_ink": false,
+      "queue_clean_between": false
+    }
+  }
+}

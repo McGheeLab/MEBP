@@ -65,6 +65,10 @@ those profiles model only motion; there is no pin/output map.
       need them to read from the same source and be alligned with each other."*)
 - [x] **2026-08-05 — the LED is turned off on shutdown** (operator: *"when i shut
       down the software make sure it turns the led off"*)
+- [x] **2026-08-14 — the slider is scaled onto a 20 % thermal ceiling** (operator:
+      *"LED illumination should default to 20% as the 100% … I am getting problems
+      with LED overheating above 30% over long times so to be safe we should just
+      make the slider go from 0-100% still, but 20% is set as the 100% condition"*)
 - [ ] **Real-HW verification on ME3B V1** (see Testing Notes)
 
 ## Testing Notes
@@ -175,3 +179,49 @@ Regression (all green): `test_v75x_context_panel`, `test_v75x_responsive_context
 - **Command-output, not sensor.** The widget only needs the status tick to grey out on disconnect; no `on_motion_tick`. Writes are debounced and connection-guarded to respect the shared, `ok`-blocking ZP serial channel.
 - **Persistence is partial (v1).** Section state restores from the `options` dict; writing state back to the layout store on change is a tracked follow-up (`store.set_section_options`).
 - **Firmware note:** Marlin acks unknown commands with `ok`, so an app/firmware command mismatch won't error — the LED just won't respond. If the board is later flashed to Case Light, change the single `M106` line in `ZPStage.set_led_brightness` to `M355`.
+
+## 2026-08-14 — thermal ceiling: the slider's 100 % is 20 % duty
+
+The emitter overheats above ~30 % duty over long soaks, so `_MAX_DUTY_PCT = 20.0`
+in `gui/widgets/illumination_control.py` now caps what the app can command:
+`_CEILING_LEVEL = 51` of the 255 Marlin PWM range, and full slider emits
+`M106 P0 S51`.
+
+- **SCALED, not clipped — this is the whole design decision.** Clipping at S51
+  would make every slider position from 20 % up produce the *same* brightness
+  while showing different numbers, i.e. a control that visibly lies and loses
+  four fifths of its resolution. Remapping keeps a full-travel 0-100 % control
+  the operator can use normally; they simply cannot reach a level that cooks the
+  LED. Pinned by `test_the_range_is_scaled_not_clipped` (mid-slider must be
+  strictly dimmer than full), which is what catches the clipping mutation.
+- **ONE enforcement point.** The ceiling lives only in `_level_from_pct`. A
+  second clamp in `ZPStage.set_led_brightness` was considered and rejected: that
+  layer still legitimately spans the full 0-255 Marlin range, it has no other
+  production caller, and a duplicate would be the redundant-guard trap this repo
+  keeps recording (a partial mutation then proves nothing). `led_off()` sends 0
+  and is unaffected.
+- **No migration, and it errs safe.** Persisted layouts store a *percentage*, so
+  an existing saved 100 % simply now means the safe level — a fifth of its former
+  power. Pinned by `test_a_persisted_hundred_percent_is_now_the_safe_ceiling`.
+- **Toggle-on-from-dark now defaults to the ceiling** (`_DEFAULT_ON_LEVEL =
+  _CEILING_LEVEL`), i.e. "on at maximum allowed", preserving the old intent.
+- **Cost, stated:** the commandable range is 51 discrete PWM steps over 0-100 %,
+  so adjacent single-percent steps can land on the same level. Harmless for an
+  illumination LED; worth knowing before anyone reads the label as exact duty.
+  The label keeps showing slider %, with the mapping explained in the tooltip.
+- **To change the ceiling** (a different LED, better heatsinking), edit
+  `_MAX_DUTY_PCT` alone — nothing else encodes it. Two tests assert the current
+  value, so a deliberate change surfaces there rather than silently.
+
+**Tests** (suite now **38**, 7 new in `TestThermalCeiling` + 2 updated):
+full slider is the ceiling and *not* `_MAX_LEVEL`; the ceiling is 20 % of 255; no
+slider position — including out-of-band 101/500/−5 — exceeds it; the range is
+scaled and monotone; percent round-trips; the real widget puts S51 on the wire; a
+persisted 100 % restores to the safe level. **2/2 mutations CAUGHT**: reverting
+the scaling to full PWM fails 7 tests; clipping instead of scaling fails 2.
+Regression: context-panel / responsive-context-panel / jog-navigation **64 green**
+plus a `gui.app` import smoke.
+
+**Needs HW confirmation on ME3B V1:** the light at slider 100 % is bright enough
+to work with, and stays cool over a long hold (this is the number to revisit if
+either is wrong).

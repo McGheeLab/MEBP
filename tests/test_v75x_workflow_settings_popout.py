@@ -523,5 +523,50 @@ class TestWorkflowPages(unittest.TestCase):
             self.assertTrue(page._size_spin.isVisibleTo(page))
 
 
+class TestACheckableButtonIsABooleanField(unittest.TestCase):
+    """v7.19.3 — ``widget_value`` recognised only ``QCheckBox``.
+
+    ``register_external`` accepts any widget, so the fluorescence panel's
+    checkable ``QPushButton`` preset toggle was registered, silently read back
+    as ``None``, never written, and reset on every launch. A checkable button IS
+    a boolean control.
+    """
+
+    def test_a_checkable_button_round_trips(self):
+        from gui.dialogs.workflow_settings_dialog import (
+            set_widget_value, widget_value)
+        from PySide6.QtWidgets import QPushButton
+        b = QPushButton("toggle")
+        b.setCheckable(True)
+        b.setChecked(True)
+        self.assertIs(widget_value(b), True)
+        self.assertTrue(set_widget_value(b, False))
+        self.assertIs(widget_value(b), False)
+
+    def test_a_plain_button_is_still_unrecognised(self):
+        """Widening this must not start persisting every action button."""
+        from gui.dialogs.workflow_settings_dialog import (
+            connect_widget_changed, set_widget_value, widget_value)
+        from PySide6.QtWidgets import QPushButton
+        b = QPushButton("Run")           # not checkable
+        self.assertIsNone(widget_value(b))
+        self.assertFalse(set_widget_value(b, True))
+        self.assertFalse(connect_widget_changed(b, lambda *_: None))
+
+    def test_a_checkbox_behaves_exactly_as_before(self):
+        from gui.dialogs.workflow_settings_dialog import (
+            connect_widget_changed, set_widget_value, widget_value)
+        from PySide6.QtWidgets import QCheckBox
+        c = QCheckBox("x")
+        c.setChecked(False)
+        self.assertIs(widget_value(c), False)
+        self.assertTrue(set_widget_value(c, True))
+        self.assertIs(widget_value(c), True)
+        seen = []
+        self.assertTrue(connect_widget_changed(c, lambda *_: seen.append(1)))
+        c.setChecked(False)
+        self.assertEqual(len(seen), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

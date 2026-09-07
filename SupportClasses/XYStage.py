@@ -79,6 +79,41 @@ def _read_response_cr(spo, timeout=0.3):
     return buf.decode("ascii", errors="replace").strip()
 
 
+def _drain_quiet(spo, quiet_s: float = 0.12, max_s: float = 0.6) -> None:
+    """Discard whatever the controller is STILL sending, then clear the buffer.
+
+    v7.18.1: a detection query can have a multi-line reply — the H117's
+    ``STAGE`` answers ``STAGE = H117P1N4/F\\rTYPE = 25\\r...``. Detection
+    matches on the FIRST line and returns immediately, so the remaining
+    lines are either sitting in the RX buffer or still in flight at 9600
+    baud. A plain ``reset_input_buffer()`` cannot remove bytes that have
+    not arrived yet, so the first position read consumed a fragment and
+    logged ``Failed to parse XY position: Expected 3 values, got 1: 'D'``.
+
+    Read until the line has been quiet for ``quiet_s`` (bounded by
+    ``max_s``), then flush. Costs ~0.12 s on a single-line reply.
+    """
+    old_timeout = getattr(spo, "timeout", None)
+    deadline = time.time() + max_s
+    try:
+        spo.timeout = quiet_s
+        while time.time() < deadline:
+            if not spo.read(256):
+                break  # quiet_s with no bytes → the reply is complete
+    except Exception:
+        pass
+    finally:
+        try:
+            if old_timeout is not None:
+                spo.timeout = old_timeout
+        except Exception:
+            pass
+        try:
+            spo.reset_input_buffer()
+        except Exception:
+            pass
+
+
 class XYStageManager:
     """
     Manager for Prior ProScan XY stages (or simulator).
@@ -97,16 +132,33 @@ class XYStageManager:
     DEFAULT_ACCELERATION = 50
     DEFAULT_VELOCITY = 50
 
+    #: How many bare acks one position query may discard before giving up.
+    #: A move is preceded by at most a couple of setters (SMS/SAS), so a
+    #: handful covers the real backlog; the cap is what stops a controller
+    #: answering nothing but acks from spinning the poller. See
+    #: ``_read_position_line``.
+    _MAX_STALE_ACKS = 4
+
     def __init__(
         self,
         simulate: bool = False,
         settings: Optional[dict] = None,
         controller_json: Optional[str] = None,
         exclude_ports: Optional[list] = None,
+        preferred: Optional[dict] = None,
     ):
         self.simulate = simulate
         self._protocol: Optional[ControllerProtocol] = None
         self._detected_controller: Optional[str] = None
+        # v7.18.1 FAST CONNECT: last-known-good detection result, as
+        # ``{"protocol": <json path>, "port": "COM3", "baud": 9600}``.
+        # Tried FIRST as a single probe; a miss falls through to the full
+        # scan, so a moved cable or a swapped controller still self-heals.
+        # Absent ⇒ byte-identical to the pre-v7.18.1 full scan.
+        self._preferred = dict(preferred) if isinstance(preferred, dict) else None
+        # Populated on a successful detection so the caller can persist it.
+        self._connected_port: Optional[str] = None
+        self._connected_baud: Optional[int] = None
         # v7.5.x: COM ports the detection scan must NEVER open. Opening a port
         # asserts DTR, which auto-RESETS an Arduino/Marlin board (the ZP stage) —
         # so the XY scan is told the sibling ZP port(s) up front and skips them.
@@ -247,6 +299,32 @@ class XYStageManager:
         """Name of the auto-detected controller (or None)."""
         return self._detected_controller
 
+    @property
+    def connected_port(self) -> Optional[str]:
+        """Serial device the live stage opened (None in sim / not found)."""
+        return self._connected_port
+
+    @property
+    def connected_baud(self) -> Optional[int]:
+        """Baud the live stage opened at (None in sim / not found)."""
+        return self._connected_baud
+
+    @property
+    def detection_hint(self) -> Optional[dict]:
+        """v7.18.1: what to persist so the NEXT connect is a single probe.
+
+        ``None`` unless a real controller was detected — the caller must
+        never write a hint that would send the next launch at a port and
+        baud nothing answered on.
+        """
+        if self.simulate or not self._connected_port or self._protocol is None:
+            return None
+        return {
+            "protocol": self._protocol.source_path,
+            "port": self._connected_port,
+            "baud": self._connected_baud,
+        }
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def stop(self) -> None:
@@ -312,6 +390,16 @@ class XYStageManager:
         if serial is None:
             raise ImportError("pyserial is required for hardware mode")
 
+        # v7.18.1 FAST CONNECT: one probe at the last-known-good
+        # (protocol, port, baud) before any scanning. On this rig the
+        # full auto-detect burned 6.8 s per connect probing five
+        # protocol/baud combinations that had ALREADY been ruled out on
+        # the previous run, all on the GUI thread (the freeze watchdog
+        # fired every time). A hit costs ~0.8 s; a miss falls through.
+        spo = self._try_preferred()
+        if spo is not None:
+            return spo
+
         if self._protocol is not None:
             # Use the loaded protocol's detection sequence
             return self._find_with_protocol(self._protocol)
@@ -319,10 +407,67 @@ class XYStageManager:
         # P8.21: Auto-detect — try each JSON file
         return self._auto_detect_controller()
 
-    def _find_with_protocol(self, protocol: ControllerProtocol) -> "Optional[serial.Serial]":
+    def _try_preferred(self) -> "Optional[serial.Serial]":
+        """v7.18.1: probe ONLY the last-known-good port+baud+protocol.
+
+        Returns the opened handle on a hit, ``None`` on any miss (bad
+        hint, excluded port, unloadable protocol, nothing answering) —
+        every miss falls through to the normal scan, so this can make a
+        connect faster but never make one fail.
+        """
+        hint = self._preferred
+        if not hint:
+            return None
+        port = hint.get("port")
+        baud = hint.get("baud")
+        proto_path = hint.get("protocol")
+        if not port or not baud:
+            return None
+        # NOTE: no exclusion check here on purpose — ``_find_with_protocol``
+        # already refuses to open an excluded port, and the whole point of
+        # that rule (opening a port DTR-resets the board behind it) means it
+        # must have exactly ONE enforcement point, not a copy per caller.
+
+        # An explicit controller_json wins — the operator picked it.
+        protocol = self._protocol
+        if protocol is None and proto_path:
+            try:
+                protocol = ControllerProtocol.load(proto_path)
+            except Exception as e:
+                logger.debug("XY fast-connect hint protocol unusable: %s", e)
+                return None
+        if protocol is None:
+            return None
+
+        t0 = time.time()
+        spo = self._find_with_protocol(protocol, only_port=port, only_baud=baud)
+        if spo is None:
+            logger.info(
+                "XY fast-connect miss (%s @ %s baud, %s) — falling back to the "
+                "full scan", port, baud, protocol.controller_name)
+            return None
+
+        if self._protocol is None:
+            self._protocol = protocol
+            self._apply_protocol_parameters()
+        logger.info(
+            "XY fast-connect: %s on %s @ %s baud in %.2fs (skipped the scan)",
+            protocol.controller_name, port, baud, time.time() - t0)
+        return spo
+
+    def _find_with_protocol(
+        self,
+        protocol: ControllerProtocol,
+        only_port: Optional[str] = None,
+        only_baud: Optional[int] = None,
+    ) -> "Optional[serial.Serial]":
         """Try to find a controller matching the given protocol.
         v7.2.8s3: Increased settle time + retry on error for reliable detection.
-        
+
+        v7.18.1: ``only_port``/``only_baud`` restrict the sweep to a single
+        candidate (the fast-connect probe). Omitted ⇒ the full sweep, with
+        the hinted port merely ordered first.
+
         Prior ProScan II returns E,5 ("not initialized") if queried too soon
         after port open, especially when the USB subsystem was churned by
         scanning other ports first. Fix: longer settle + DTR toggle + retry.
@@ -340,8 +485,31 @@ class XYStageManager:
         # ``communication.baud_rates``, this is a single-element list = the
         # existing ``baud_rate`` — byte-identical to the pre-v7.5.x behavior.
         bauds = protocol.baud_rate_candidates
+        if only_baud is not None:
+            # Restricted probe: honour the hint only if the protocol really
+            # supports that baud, else the hint is stale — miss and rescan.
+            if int(only_baud) not in [int(b) for b in bauds]:
+                return None
+            bauds = [int(only_baud)]
 
-        ports = serial.tools.list_ports.comports()
+        ports = list(serial.tools.list_ports.comports())
+        if only_port is not None:
+            want = str(only_port).upper()
+            ports = [p for p in ports if str(p.device).upper() == want]
+            if not ports:
+                logger.debug("XY fast-connect: %s is no longer present", only_port)
+                return None
+        else:
+            # v7.18.1: even on a full scan, try the last-known-good port
+            # first — a hint whose BAUD went stale still saves every other
+            # port's probe time.
+            # getattr-guarded: several suites drive this method on a
+            # ``__new__``-partial manager that sets only what it touches.
+            _pref = getattr(self, "_preferred", None) or {}
+            hinted = str(_pref.get("port") or "").upper()
+            if hinted:
+                ports.sort(key=lambda p: str(p.device).upper() != hinted)
+
         exclude = getattr(self, "_exclude_ports", set())
         for port_info in ports:
             # v7.5.x: never open an excluded port (e.g. the ZP/Marlin board).
@@ -432,9 +600,8 @@ class XYStageManager:
                                 f"{port_info.device} @ {baud} baud "
                                 f"(pattern match: {response!r})"
                             )
-                            spo.timeout = protocol.timeout
-                            self._detected_controller = protocol.controller_name
-                            return spo
+                            return self._claim_port(
+                                spo, protocol, port_info.device, baud)
                         else:
                             spo.close()
                             continue  # next candidate baud
@@ -446,9 +613,8 @@ class XYStageManager:
                             f"{port_info.device} @ {baud} baud "
                             f"(token match: {response!r})"
                         )
-                        spo.timeout = protocol.timeout
-                        self._detected_controller = protocol.controller_name
-                        return spo
+                        return self._claim_port(
+                            spo, protocol, port_info.device, baud)
 
                     spo.close()
                 except (serial.SerialException, UnicodeDecodeError, OSError) as e:
@@ -457,6 +623,27 @@ class XYStageManager:
 
         logger.debug(f"{protocol.controller_name} not found on any port")
         return None
+
+    def _claim_port(self, spo, protocol: ControllerProtocol,
+                    device: str, baud: int):
+        """Adopt a matched handle as the session port (v7.18.1).
+
+        The ONE place a detection match becomes the live connection, so the
+        session timeout, the recorded controller name and the port/baud the
+        fast-connect hint is built from can never disagree.
+        """
+        # Drain the REST of the detection reply before anyone reads a
+        # position: the match was made on the first line of what may be a
+        # multi-line answer still arriving on the wire.
+        _drain_quiet(spo)
+        spo.timeout = protocol.timeout
+        self._detected_controller = protocol.controller_name
+        self._connected_port = device
+        try:
+            self._connected_baud = int(baud)
+        except (TypeError, ValueError):
+            self._connected_baud = None
+        return spo
 
     def _auto_detect_controller(self) -> Optional[serial.Serial]:
         """
@@ -642,7 +829,7 @@ class XYStageManager:
                 except Exception:
                     pass
                 self._send_protocol_command("position_query", fallback_cmd="P")
-                response = _read_response_cr(self.spo, timeout=0.5)
+                response = self._read_position_line(total_timeout=0.5)
             result = self._parse_position_response(response)
             _dbg.log("POLL", raw_rx=repr(response),
                      pos_x=result[0], pos_y=result[1], pos_z=result[2])
@@ -652,6 +839,64 @@ class XYStageManager:
             _dbg.log("QUERY_ERR", note=str(e))
             return (None, None, None)
 
+
+    def _is_bare_ack(self, line: str) -> bool:
+        """True when ``line`` is only a command acknowledgement, no payload.
+
+        Prior answers a bare ``R`` to every command (including SMS/SAS/G); the
+        LEP MAC 5000 answers ``:A``. A position reply always carries values, so
+        an ack ALONE on a line is by definition left over from an earlier write.
+        Deliberately exact-match on the stripped line: ``:A 399 321`` is a real
+        Ludl position reply and must NOT be mistaken for an ack.
+        """
+        if not line:
+            return False
+        text = line.strip()
+        if not text:
+            return False
+        tok = (self._protocol.ack_success_token if self._protocol else "R") or "R"
+        return text == tok.strip()
+
+    def _read_position_line(self, total_timeout: float = 0.5) -> str:
+        """Read replies until one is not a bare ack, or the budget runs out.
+
+        v7.17.1 — THE FIX FOR ``Expected 3 values, got 1: R``.
+
+        ``get_current_position`` already flushes the RX buffer before querying,
+        but a flush can only discard bytes that have ALREADY ARRIVED. The Prior
+        acks every write, so a move issued milliseconds earlier leaves an ``R``
+        still in flight: the flush finds nothing, ``P`` goes out, and the first
+        line back is that late ack rather than the position. The operator's log
+        shows it exactly — two moves, each preceded by an SMS, then
+        ``Failed to parse XY position: Expected 3 values, got 1: R``.
+
+        The consequence is not cosmetic. A failed parse returns ``(None,None,None)``,
+        which clears the poller's ``_last_position_read_ok``, makes
+        ``wait_for_xy_arrival`` poll garbage until it times out, and leaves every
+        cached-position reader stale — which is what "the software got very
+        slow" is made of.
+
+        ⚠ This is deliberately a READ-side fix. ``_send_protocol_command``
+        carries an explicit v7.5.x note that draining the ack after each WRITE
+        was tried on real hardware and made things worse (the Prior stopped
+        answering ``P`` at all). Nothing about the write path changes here; we
+        only decline to mistake an ack for a position. Skipping is bounded by a
+        wall-clock budget and by a cap on how many acks may be swallowed, so a
+        controller that answered nothing but acks can never spin the poller.
+        """
+        deadline = time.monotonic() + total_timeout
+        for _ in range(self._MAX_STALE_ACKS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            line = _read_response_cr(self.spo, timeout=min(remaining, 0.5))
+            if not self._is_bare_ack(line):
+                # Includes the empty/timeout case: report it unchanged so the
+                # existing "no answer" handling is untouched.
+                return line
+            logger.debug("XY: discarded a stale %r ack before the position reply",
+                         line.strip())
+        return ""
 
     def _parse_position_response(
         self, response: str

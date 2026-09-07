@@ -81,6 +81,8 @@ from PySide6.QtWidgets import (
 from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card, FormRow
+from gui.widgets.section_stack import (
+    PromotedSectionsPanel, wire_section_promotion)
 from gui.widgets.live_target_picker import LiveTargetPicker, PROV_MOSAIC
 from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
@@ -276,6 +278,15 @@ class CellTargetingWorkflowPage(QWidget):
 
         self._refresh_volume_label()
         self._refresh_readiness()
+        # v7.21: a section moved out of ⚙ Settings lands in the drawer, which is
+        # hidden (zero footprint) until something is in it. AFTER the run row on
+        # purpose, so Start / Abort never move.
+        self._promoted_panel = PromotedSectionsPanel()
+        outer.addWidget(self._promoted_panel)
+        self._layout_store = wire_section_promotion(
+            self, self._settings_dialog, self._promoted_panel.stack,
+            settings=self._settings, workflow_id="cell_targeting")
+
         self._settings_dialog.load_last()
         self._refresh_reagent_status()
         self._refresh_prep_status()
@@ -1310,6 +1321,23 @@ class CellTargetingWorkflowPage(QWidget):
             "page — one value used everywhere).")
         sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
                        0.0, common_key="pump_settle_time_s", overridable=False)
+        # v7.21.7: hold the needle in the liquid after a reagent aspirate. A
+        # SEPARATE knob from the settle dwell above, because they cover different
+        # halves of the same move: the settle dwell brackets a pump move that
+        # already blocks until the PLUNGER has drained from Marlin's planner,
+        # while this one covers the FLUID still being drawn in afterwards through
+        # a compliant column. Lift Z inside that window and the tail of the
+        # aspirate is air.
+        self._g_hold_liquid = self._dspin(0.0, 120.0, 2.0, " s", 2, 0.5)
+        self._g_hold_liquid.setToolTip(
+            "Extra time the needle stays IN THE LIQUID after a reagent aspirate "
+            "(ink / oil / buffer) finishes, before Z retracts and the stage "
+            "travels on. Raise it if a pickup ends with air drawn into the "
+            "needle; 0 = no extra hold.")
+        sec.add_common("g_hold_liquid", "Hold in liquid after aspirating",
+                       self._g_hold_liquid, 2.0,
+                       common_key="pump_post_aspirate_dwell_s",
+                       overridable=False)
         sec.add_common("g_prime", "Prime time", self._g_prime, 0.25,
                        common_key="pump_prime_time_s", overridable=False)
 

@@ -53,8 +53,13 @@ CAPTURE_DEFAULTS: dict = {
     "video_quality": 80,           # 1..100 (honoured by MJPG, not by mp4v)
     "video_container": "mp4",      # "mp4" | "avi"
     "video_template": "{date}_{time}_{camera}",
-    "video_max_seconds": 600,      # 0 = unlimited
-    "video_max_gb": 8.0,           # 0 = unlimited
+    # v7.21.8: NO time limit by default (was 600 = 10 min, which stopped a
+    # recording mid-experiment with no warning). The time cap never protected
+    # anything the SIZE cap below does not protect better — a runaway recording
+    # is a disk problem, and bytes are what fills a disk, not minutes. So the
+    # size cap is the guard and the clock is left to the operator.
+    "video_max_seconds": 0,        # 0 = unlimited
+    "video_max_gb": 8.0,           # 0 = unlimited (see container_byte_limit)
     "raw_timelapse_interval_s": 1.0,
     # ── metadata ──────────────────────────────────────────────────
     "embed_metadata": True,        # inside the PNG/TIFF itself

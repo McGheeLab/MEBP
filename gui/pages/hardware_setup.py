@@ -84,6 +84,9 @@ from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
 from gui.widgets.icons import icon, icon_button
 from gui.widgets.components import StatusBadge  # v7.4.x rev3 polish
+# v7.19: the ordered applier lives beside the persisted key list so the restore
+# path and the fluorescence workflow's preset cannot apply them differently.
+from gui.widgets.hw_controls_snapshot import apply_hw_controls
 
 logger = logging.getLogger(__name__)
 
@@ -489,29 +492,51 @@ class PumpChannelWidget(QGroupBox):
         return names[0] if names else None
 
 
+# How long an edit waits before the app-wide config fan-out runs (v7.21.3).
+# Long enough to coalesce a burst of keystrokes / a held spin arrow into one
+# propagation, short enough that a single deliberate edit still lands before the
+# operator can navigate away. Both boundaries that could lose a pending emit --
+# leaving the page, and quitting -- flush it explicitly.
+CONFIG_EMIT_DEBOUNCE_MS = 250
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Pulled-capillary geometry spin definitions (v7.9)
 # ═══════════════════════════════════════════════════════════════════
 # ONE table of (min, max, step, decimals, suffix, default, tooltip) shared by
 # the single-needle capillary card AND every per-bore row, so a backpack's
 # second bore can never end up with a different range, default or tooltip than
-# the first. Ranges are deliberately WIDER than the common band (10–100 µm tips,
-# 1–10 mm pulls, 100 mm blanks): a spin range that clips a legitimate outlier
-# corrupts the value silently, whereas ``validate()`` can warn.
+# the first.
+#
+# v7.21.3 — THE RANGES ARE OPEN ON PURPOSE. They used to bracket the common band
+# (0.5–500 µm tips, 0.1–50 mm pulls, 50–3000 µm blanks), which made a legitimate
+# outlier untypeable: a spin box does not merely reject an out-of-range number,
+# it silently REWRITES it while you type, so pulling a 0.3 µm tip or a 600 µm
+# blank gave you a plausible-looking value you never entered. Every constraint
+# the old range encoded — a diameter that must exceed 0, a tip wider than its
+# own barrel, an OD inside its ID — is already checked by
+# ``HardwareConfig._needle_bore_issues`` and reported BY NAME on the page. A
+# named warning about the number you actually typed beats a clamp you cannot
+# see, so the bounds here exist only to keep the widget finite. 0 is admitted
+# throughout and reads as "not set", which validate() reports.
+_CAP_DIA_MAX_UM = 100_000.0     # 100 mm — nothing glass is drawn from is wider
+_CAP_LEN_MAX_MM = 10_000.0      # 10 m
 _CAP_SPIN_SPECS = {
-    "barrel_id": (50.0, 3000.0, 10.0, 1, " µm", 1000.0,
+    "barrel_id": (0.0, _CAP_DIA_MAX_UM, 10.0, 2, " µm", 1000.0,
                   "Bore of the glass blank before the pull."),
-    "barrel_od": (100.0, 4000.0, 10.0, 1, " µm", 1500.0,
+    "barrel_od": (0.0, _CAP_DIA_MAX_UM, 10.0, 2, " µm", 1500.0,
                   "Outside of the glass blank — drives the drawn needle width."),
-    "barrel_len": (1.0, 200.0, 1.0, 1, " mm", 100.0,
+    "barrel_len": (0.0, _CAP_LEN_MAX_MM, 1.0, 3, " mm", 100.0,
                    "Bulk section only — the total needle length is barrel + tip."),
-    "tip_id": (0.5, 500.0, 1.0, 1, " µm", 30.0,
+    "tip_id": (0.0, _CAP_DIA_MAX_UM, 1.0, 2, " µm", 30.0,
                "The orifice. Sets the deposited feature size and dominates the "
-               "flow resistance (flow scales with diameter to the 4th power)."),
-    "tip_od": (0.0, 1000.0, 1.0, 1, " µm", 0.0,
+               "flow resistance (flow scales with diameter to the 4th power). "
+               "Any value is accepted — an implausible one is reported as a "
+               "validation warning, not clamped."),
+    "tip_od": (0.0, _CAP_DIA_MAX_UM, 1.0, 2, " µm", 0.0,
                "Leave at 0 if unknown — the drawn needle and clearance views then "
                "fall back to the barrel's OD/ID ratio applied to the tip Ø."),
-    "tip_len": (0.1, 50.0, 0.1, 2, " mm", 5.0,
+    "tip_len": (0.0, _CAP_LEN_MAX_MM, 0.1, 3, " mm", 5.0,
                 "Length of the pulled section."),
 }
 
@@ -539,6 +564,13 @@ def _make_cap_spin(key: str, on_change=None) -> QDoubleSpinBox:
     sb.setSuffix(suffix)
     sb.setValue(value)
     sb.setToolTip(tip)
+    # v7.21.3: commit typed text on Enter / focus-out, not per keystroke.
+    # Typing "300" otherwise walks the LIVE needle through 3 µm and 30 µm --
+    # each a real config change that is fanned out to every page and written to
+    # settings.json (see CONFIG_EMIT_DEBOUNCE_MS). Arrow steps still apply
+    # immediately, so only the half that was never a value the operator meant
+    # is suppressed.
+    sb.setKeyboardTracking(False)
     if on_change is not None:
         sb.valueChanged.connect(on_change)
     return sb
@@ -603,6 +635,30 @@ class HardwareSetupPage(ModePage):
         self._config = HardwareConfig()
         self._last_valid = False
         self._restoring = False  # v7.2.6: guard for config restore
+
+        # v7.21.3: DEBOUNCED config fan-out. `config_changed` is not a local
+        # notification — MainWindow answers it by writing settings.json AND
+        # calling `set_hardware_config` on every page, which cascades into the
+        # sketch page's sequence rebuild, the calibration page's own fan-out and
+        # Quick Print's readiness rebuild. That is multi-second work, and a
+        # QDoubleSpinBox emits `valueChanged` on EVERY keystroke, so typing a
+        # needle dimension ran the whole cascade once per digit and the GUI
+        # thread stalled (logs/freeze.log, 2026-08-19 16:21, six stalls all
+        # rooted at `_on_needle_changed`). The page's OWN readouts stay
+        # synchronous — they are ~1 ms — so only the app-wide fan-out waits.
+        self._config_emit_pending = False
+        self._config_emit_timer = QTimer(self)
+        self._config_emit_timer.setSingleShot(True)
+        self._config_emit_timer.setInterval(CONFIG_EMIT_DEBOUNCE_MS)
+        self._config_emit_timer.timeout.connect(self._flush_config_changed)
+        # hideEvent covers navigating away; this covers closing the app while
+        # still ON this page, which no page-level event reliably reports.
+        try:
+            _qapp = QApplication.instance()
+            if _qapp is not None:
+                _qapp.aboutToQuit.connect(self._flush_config_changed)
+        except Exception:
+            pass
 
         # v7.5.x: one-time auto-detect of cameras on first display so a
         # remembered camera setup (role→identity assignments + per-camera
@@ -989,6 +1045,33 @@ class HardwareSetupPage(ModePage):
         self._pump_prime_spin.valueChanged.connect(self._on_config_changed)
         timing_lay.addWidget(self._pump_prime_spin, 1, 1)
 
+        # v7.21.7: HOLD IN LIQUID AFTER ASPIRATING. Distinct from Settle time,
+        # and the distinction is the reason this exists: Settle brackets a pump
+        # move that already blocks until the PLUNGER has drained from Marlin's
+        # planner, so the plunger is provably finished — but a compliant fluid
+        # column keeps drawing in after it stops, and if Z lifts inside that
+        # window the tip is in AIR and the tail of the aspirate is air.
+        timing_lay.addWidget(QLabel("Hold in liquid:"), 2, 0)
+        self._pump_hold_liquid_spin = QDoubleSpinBox()
+        self._pump_hold_liquid_spin.setRange(0.0, 120.0)
+        self._pump_hold_liquid_spin.setDecimals(2)
+        self._pump_hold_liquid_spin.setSingleStep(0.5)
+        self._pump_hold_liquid_spin.setSuffix(" s")
+        self._pump_hold_liquid_spin.setToolTip(
+            "Extra time the needle is held STILL IN THE LIQUID after a reagent "
+            "aspirate (ink, oil, buffer) finishes, before Z retracts and the "
+            "stage travels on.\n\n"
+            "The pump move already waits for the plunger to finish, but the "
+            "fluid column is compressible: with a fine bore or a viscous ink, "
+            "liquid keeps being drawn in for a while after the plunger stops. "
+            "Lift the needle inside that window and it finishes the aspirate in "
+            "AIR — the needle then prints little or nothing.\n\n"
+            "Raise this if you see air drawn in at the end of a pickup. Applies "
+            "to every workflow's reagent pickups; not to dispensing, the print "
+            "path, or manual jog. 0 = no extra hold.")
+        self._pump_hold_liquid_spin.valueChanged.connect(self._on_config_changed)
+        timing_lay.addWidget(self._pump_hold_liquid_spin, 2, 1)
+
         # v7.5.x: pressure relief / compliance is now an absolute µL value PER
         # PUMP (retired the old "% of syringe" spin + 3 context toggles). It is
         # measured by the Needle Location compliance calibration and applied as
@@ -1001,7 +1084,7 @@ class HardwareSetupPage(ModePage):
             "Common Print Settings, and enable backlash compensation from the "
             "pump jog panel.")
         _relief_note.setWordWrap(True)
-        timing_lay.addWidget(_relief_note, 2, 0, 1, 3)
+        timing_lay.addWidget(_relief_note, 3, 0, 1, 3)
 
         # v7.5.x: needle-derived MAX SAFE FLOW readout (Hagen–Poiseuille from the
         # needle bore + length at a fixed water-reference viscosity). This is the
@@ -3923,6 +4006,13 @@ class HardwareSetupPage(ModePage):
             self._flush_crop_persist()
         except Exception:
             pass
+        # v7.21.3: same reasoning for the debounced config fan-out -- an edit
+        # made just before navigating away must still reach the other pages
+        # and settings.json.
+        try:
+            self._flush_config_changed()
+        except Exception:
+            pass
         super().hideEvent(event)
 
     def _maybe_auto_detect_cameras(self):
@@ -4586,80 +4676,27 @@ class HardwareSetupPage(ModePage):
             logger.debug(f"log_hw_settings failed: {exc}")
 
     def _apply_hw_controls(self, cam_idx: int, hw: dict):
-        """Push a persisted hardware-control set onto a running camera."""
+        """Push a persisted hardware-control set onto a running camera.
+
+        v7.19: the ordering rules moved to ``hw_controls_snapshot`` beside the
+        persisted key list, because the fluorescence workflow now applies and
+        restores the same keys and a second hand-written applier would drift
+        from this one exactly as the two key lists once did. Only the
+        microscope-resolution decision stays here — it needs the page's config.
+        """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is None or not isinstance(hw, dict):
             return
-        auto = hw.get("auto_exposure")
-        # Only drive auto-exposure when we have a CLEAN boolean. OpenCV/DShow
-        # cameras often report a raw CAP_PROP value (e.g. -1.0) or nothing for
-        # auto-exposure; coercing that via bool() would wrongly force auto ON,
-        # so ignore non-bool values rather than guess.
-        if isinstance(auto, bool):
-            mgr.set_hw_auto_exposure(cam_idx, auto)
-        res = hw.get("resolution")
-        if res:
-            # v7.5.x: the MICROSCOPE resolution has ONE source of truth
-            # (active_resolution), applied on start — don't let a per-identity
-            # hw_controls resolution compete for it (non-microscope cameras keep
-            # their per-identity resolution).
-            try:
-                is_mic = (cam_idx
-                          == self._config.camera_for_role(CameraRole.MICROSCOPE))
-            except Exception:
-                is_mic = False
-            if not is_mic:
-                try:
-                    mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
-                except Exception as exc:
-                    logger.debug(f"restore resolution failed: {exc}")
-        # v7.13 — Andor sensor-quality features, BEFORE the exposure restore
-        # (v7.13.x: the achievable exposure range depends on the readout rate
-        # and gain mode, so the saved exposure must be applied against the
-        # constraint set it was saved UNDER, not the open-time defaults) and
-        # BEFORE the display-scaling block (the manual black/white levels are
-        # raw counts whose meaning depends on the bit depth the gain mode
-        # selects, so the stored levels must be the LAST thing applied).
-        # Within this block: gain mode first (it constrains bit depth and the
-        # legal readout rates), then readout rate, then the booleans.
-        if hasattr(mgr, "set_hw_andor_feature"):
-            if isinstance(hw.get("andor_gain_mode"), str):
-                mgr.set_hw_andor_feature(cam_idx, "andor_gain_mode",
-                                         hw["andor_gain_mode"])
-            if isinstance(hw.get("andor_readout_rate"), str):
-                mgr.set_hw_andor_feature(cam_idx, "andor_readout_rate",
-                                         hw["andor_readout_rate"])
-            for key in ("andor_sensor_cooling", "andor_noise_filter",
-                        "andor_blemish_correction"):
-                if isinstance(hw.get(key), bool):
-                    mgr.set_hw_andor_feature(cam_idx, key, hw[key])
-        # Restore manual exposure/gain UNLESS auto-exposure is explicitly on.
-        # (When auto is unknown/None — e.g. an OpenCV cam — we still restore the
-        # saved exposure so "reload exactly" holds; there's no auto state to
-        # clobber. Previously `if not auto:` skipped restore only when auto was
-        # truthy, which was correct, but `auto is not True` is clearer + robust
-        # to the non-bool values now filtered above.)
-        if auto is not True:
-            if hw.get("exposure_us") is not None:
-                mgr.set_hw_exposure_us(cam_idx, hw["exposure_us"])
-            if hw.get("exposure_gain_pct") is not None:
-                mgr.set_hw_exposure_gain(cam_idx, hw["exposure_gain_pct"])
-        if hw.get("gamma") is not None:
-            mgr.set_hw_gamma(cam_idx, hw["gamma"])
-        if hw.get("brightness") is not None:
-            mgr.set_hw_brightness(cam_idx, hw["brightness"])
-        if hw.get("contrast") is not None:
-            mgr.set_hw_contrast(cam_idx, hw["contrast"])
-        # Andor (Zyla) display scaling. Auto flag FIRST — turning auto off
-        # seeds the levels from the last auto frame, so the stored manual
-        # levels must be applied after it to win.
-        ascale = hw.get("andor_auto_scale")
-        if isinstance(ascale, bool) and hasattr(mgr, "set_hw_andor_auto_scale"):
-            mgr.set_hw_andor_auto_scale(cam_idx, ascale)
-        if hw.get("andor_scale_lo") is not None and hasattr(mgr, "set_hw_andor_scale_lo"):
-            mgr.set_hw_andor_scale_lo(cam_idx, hw["andor_scale_lo"])
-        if hw.get("andor_scale_hi") is not None and hasattr(mgr, "set_hw_andor_scale_hi"):
-            mgr.set_hw_andor_scale_hi(cam_idx, hw["andor_scale_hi"])
+        # v7.5.x: the MICROSCOPE resolution has ONE source of truth
+        # (active_resolution), applied on start — don't let a per-identity
+        # hw_controls resolution compete for it (non-microscope cameras keep
+        # their per-identity resolution).
+        try:
+            is_mic = (cam_idx
+                      == self._config.camera_for_role(CameraRole.MICROSCOPE))
+        except Exception:
+            is_mic = False
+        apply_hw_controls(mgr, cam_idx, hw, skip_resolution=is_mic)
 
     def _on_calibrate_slot_rotation(self, cam_idx: int):
         """v7.5.x: measure THIS slot's camera rotation relative to the stage.
@@ -5952,6 +5989,43 @@ class HardwareSetupPage(ModePage):
         self._sync_loc_plate_on_config_change()
         # v7.5.x: keep the needle-derived max-flow readout in sync with the needle.
         self._refresh_max_flow_display()
+        # v7.21.3: everything above is this page's own state and is ~1 ms, so it
+        # stays synchronous and the readouts track the spin box live. The emit
+        # is what costs seconds (see the timer in __init__), so it is coalesced.
+        self._schedule_config_changed()
+
+    def _schedule_config_changed(self):
+        """Queue the app-wide ``config_changed`` fan-out (v7.21.3).
+
+        Restarting the timer on every edit is the point: a burst of keystrokes
+        collapses to ONE propagation. ``_config_emit_pending`` is what makes the
+        flush safe to call unconditionally -- it can never emit a config the
+        page did not actually change.
+        """
+        self._config_emit_pending = True
+        timer = getattr(self, "_config_emit_timer", None)
+        if timer is None:          # an edit during construction -- emit now
+            self._flush_config_changed()
+            return
+        timer.start()
+
+    def _flush_config_changed(self):
+        """Emit any pending ``config_changed`` immediately.
+
+        Called from the timer, from ``hideEvent`` and from ``aboutToQuit`` --
+        a pending emit must never be dropped, because the receiver persists the
+        config to settings.json. Best-effort: a page torn down mid-flush must
+        not raise into Qt.
+        """
+        timer = getattr(self, "_config_emit_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        if not getattr(self, "_config_emit_pending", False):
+            return
+        self._config_emit_pending = False
         self.config_changed.emit(self._config)
 
     def _refresh_max_flow_display(self):
@@ -6113,6 +6187,9 @@ class HardwareSetupPage(ModePage):
         if hasattr(self, "_pump_prime_spin"):
             self._config.pump_prime_time_s = float(
                 self._pump_prime_spin.value())
+        if hasattr(self, "_pump_hold_liquid_spin"):   # v7.21.7
+            self._config.pump_post_aspirate_dwell_s = float(
+                self._pump_hold_liquid_spin.value())
 
         # v7.2.4 S3.12: Capture channel map state
         self._config.needle_channel_pump_map.clear()
@@ -6887,6 +6964,11 @@ class HardwareSetupPage(ModePage):
             self._pump_prime_spin.setValue(
                 float(getattr(self._config, "pump_prime_time_s", 0.25) or 0.0))
             self._pump_prime_spin.blockSignals(False)
+        if hasattr(self, "_pump_hold_liquid_spin"):   # v7.21.7
+            self._pump_hold_liquid_spin.blockSignals(True)
+            self._pump_hold_liquid_spin.setValue(float(
+                getattr(self._config, "pump_post_aspirate_dwell_s", 2.0) or 0.0))
+            self._pump_hold_liquid_spin.blockSignals(False)
         # v7.5.x: pressure relief / compliance is now per-pump µL (device
         # profile), not a HardwareConfig field — no UI to sync here.
         # v7.5.x: refresh the needle-derived max-flow readout on config load.
@@ -7028,6 +7110,12 @@ class HardwareSetupPage(ModePage):
         # ── 9. Emit signals ──────────────────────────────────────
         self._restoring = False
         self._on_config_changed()
+        # v7.21.3: a whole-config restore is ONE deliberate action that replaces
+        # the plate, needle and pumps together, so it propagates at once rather
+        # than waiting out the keystroke debounce. Same reasoning as the crop
+        # store's `persist_now`: coalescing is for a burst of edits, never for a
+        # single discrete decision.
+        self._flush_config_changed()
         logger.info("Config restore complete")
 
     # ════════════════════════════════════════════════════════════════

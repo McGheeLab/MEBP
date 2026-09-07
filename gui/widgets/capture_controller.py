@@ -467,6 +467,14 @@ class _RecordingSession:
         last_seen = time.monotonic()
         max_s = float(self._cfg.get("video_max_seconds", 0) or 0)
         max_b = float(self._cfg.get("video_max_gb", 0) or 0) * (1024 ** 3)
+        # v7.21.8: with no time cap the size cap is the only automatic stop, so
+        # it has to be one the CONTAINER can actually honour — an AVI is clamped
+        # to what RIFF's 32-bit offsets can describe. A raw time-lapse is a
+        # directory of TIFFs, not one container, so it keeps the operator's value.
+        if not self._raw:
+            from SupportClasses.CaptureVideoWriter import container_byte_limit
+            max_b = container_byte_limit(
+                self._cfg.get("video_container", "mp4"), max_b)
         try:
             while not self._stop.is_set():
                 try:

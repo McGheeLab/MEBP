@@ -5,18 +5,32 @@ v7.5.x: Captures a high-resolution stitched mosaic of ONE well, once per
 fluorescence channel (DAPI / FITC / mCherry / Cy5 …). The workflow rasters a full
 single-well mosaic for the current channel, then moves to the next channel.
 
-⚠ v7.18 — WHICH FILTER CUBE IS IN THE LIGHT PATH IS NOW A KNOWN, DRIVABLE FACT.
-This docstring used to assert "there is no filter-wheel hardware, so the operator
-switches the physical filter/illumination between channels". That is no longer
-true: the Nikon Ti's ``FilterBlockCassette1`` is motorized and hardware-verified
+⚠ WHICH FILTER CUBE IS IN THE LIGHT PATH IS A KNOWN, DRIVABLE FACT.
+This docstring once asserted "there is no filter-wheel hardware, so the operator
+switches the physical filter/illumination between channels". That is not true:
+the Nikon Ti's ``FilterBlockCassette1`` is motorized and hardware-verified
 switching all six slots with read-back, and ``MicroscopeController.set_filter``
-has been public the whole time. The per-channel prompt is therefore a fallback,
-not the mechanism — the cube is resolved through
-``OpticsRegistry.find_slot``/``OpticsService.ensure_filter`` and switched
-automatically, and the operator is only asked when that REFUSES (no body
-connected, an unnamed/empty slot, or a channel name that does not resolve to a
-cube — this rig's cassette holds a cube labelled "TxRed" while the channel
-vocabulary says "mCherry", which the software must never equate on its own).
+has been public the whole time.
+
+⚠⚠ v7.18 then replaced that claim with the OPPOSITE one — that the cube is
+switched automatically — while the code to do it did not exist anywhere; every
+channel still got an unconditional modal. **v7.19 is where the code landed**, so
+the paragraph below now describes the shipped behaviour rather than an intent:
+``_ensure_cube_for`` resolves the channel through
+``FluorescenceMosaicStore.channel_slot`` (exact → normalized → operator alias →
+the body's own name, REFUSING rather than guessing) and drives it with
+``OpticsService.ensure_filter``, which verifies by read-back. The per-channel
+prompt is the fallback, shown with the refusal reason when there is no body, the
+slot is unnamed or empty, the channel name does not resolve to a cube (this
+rig's cassette holds "TxRed" while the channel vocabulary says "mCherry", which
+the software must never equate on its own), or the backend is SIMULATED — a
+simulated switch is not a real one, and the operator still has a cube to move.
+
+v7.19 also moved every acquisition control — objective, cubes, per-cube exposure
+/ gain / averaging / display levels, the camera preset toggle and the scan order
+— onto this workflow's own left context panel
+(``gui/widgets/fluorescence_controls_panel.py``), above a live raw histogram, so
+a signal is judged BEFORE the run rather than in a modal partway through it.
 
 Because every channel of a well reuses the SAME raster grid + camera scale, their
 composites register pixel-for-pixel; the workflow blends them into a false-colour
@@ -34,6 +48,7 @@ It deliberately omits the well-detection pass (we already know the well).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from typing import Optional
@@ -51,11 +66,20 @@ from PySide6.QtWidgets import (
 from gui.styles import COLORS
 from gui.scaling import s, sf, sp
 from gui.widgets.components import Card
+from gui.widgets.section_stack import (
+    PromotedSectionsPanel, wire_section_promotion)
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.jog_well_plate import WellPlateNavigator
 from gui.widgets.jog_workspace_view import pixmap_from_bgr
 from gui.worker_retirement import retire_worker
 from gui.dialogs.workflow_settings_dialog import WorkflowSettingsDialog
+# v7.19 — the workflow's own left context panel. `_ChannelPill` is re-exported
+# from here under its historical name so every existing reference resolves to
+# the one class.
+from gui.widgets.fluorescence_controls_panel import (  # noqa: F401
+    FluorescenceControlsPanel, _ChannelPill)
+from gui.widgets.hw_controls_snapshot import (
+    apply_hw_controls, fluorescence_preset, hw_controls_snapshot)
 
 from SupportClasses import FluorescenceMosaicStore as fms
 from SupportClasses.CaptureTiming import resolve_grab_timing
@@ -87,6 +111,25 @@ logger = logging.getLogger(__name__)
 PROBE_HALF_RANGE_UM = 150.0
 
 
+@dataclasses.dataclass
+class ChannelPlan:
+    """One channel's builder + signal recipe, for a tile-major run (v7.19).
+
+    ``levels`` is the frozen mono16→8-bit conversion for THIS channel. The
+    operator's explicit black/white beat the probe's measurement — they set
+    them while watching the histogram, so the saved mosaic should look like the
+    preview did. Left None, the probe measures them at the well centre.
+    """
+
+    channel: str
+    builder: object
+    exposure_us: float = 0.0
+    gain_pct: "float | None" = None
+    avg_frames: int = 1
+    levels: "tuple[float, float] | None" = None
+    frames_used: int = 0
+
+
 class _SingleWellMosaicWorker(QThread):
     """Raster + grab + stitch ONE channel of a single-well mosaic on a
     background thread (mirrors calibration._MosaicScanWorker, no detection).
@@ -108,6 +151,10 @@ class _SingleWellMosaicWorker(QThread):
     # v7.13: 6th arg = meta dict {display_levels, avg_frames, exposure_us,
     # levels_degenerate, af_note, af?, focus_map?}.
     finished_ok = Signal(object, object, float, int, object, object)
+    # v7.19 tile-major: one per channel as it completes, then finished_all.
+    # Same payload as finished_ok with the channel name prepended.
+    channel_done = Signal(str, object, object, float, int, object, object)
+    finished_all = Signal()
     failed = Signal(str)
 
     _MAX_CONSEC_NONE = 8
@@ -120,7 +167,7 @@ class _SingleWellMosaicWorker(QThread):
                  scope=None, autofocus=None, tracker=None,
                  focus_predictor=None, optics=None,
                  probe_half_range_um=PROBE_HALF_RANGE_UM,
-                 probe_sigma_um=None, parent=None):
+                 probe_sigma_um=None, channels=None, parent=None):
         super().__init__(parent)
         self._controller = controller
         self._cam = cam
@@ -132,6 +179,10 @@ class _SingleWellMosaicWorker(QThread):
         self._settle_ms = max(0, int(settle_ms))
         self._registration_method = str(registration_method or "fourier_mellin")
         self._stop = False
+        # v7.19 — non-empty switches this worker to TILE-MAJOR. Empty keeps the
+        # legacy single-channel path completely untouched.
+        self._channels = list(channels or [])
+        self._optics_service = None
         # v7.13 — averaged raw capture with per-channel FROZEN display levels.
         self._avg_frames = max(1, int(avg_frames))
         self._probe_xy = probe_xy
@@ -418,6 +469,209 @@ class _SingleWellMosaicWorker(QThread):
             logger.warning("Fluor mosaic: focus did not restore to its entry "
                            "value — check the body")
 
+    # ── v7.19: tile-major (every colour per tile) ─────────────────
+
+    def _optics(self):
+        """An OpticsService built ON THIS THREAD, or None.
+
+        Constructed with the SAME owner string this worker already holds the
+        lease under: ``try_acquire`` is re-entrant per thread ident, and
+        ``OpticsService._ensure`` releases only a lease it actually took, so
+        the nesting is by design rather than by luck.
+        """
+        if self._optics_service is not None:
+            return self._optics_service
+        try:
+            from gui.widgets.optics_ensure import build_service
+            self._optics_service = build_service(self._LEASE)
+        except Exception:
+            self._optics_service = None
+        return self._optics_service
+
+    def _select_channel(self, plan) -> bool:
+        """Put ``plan``'s cube in the path and apply its recipe. False = stop.
+
+        A refusal ABORTS the run rather than capturing the tile through
+        whatever cube happens to be fitted — a channel silently captured
+        through the wrong cube is a result nothing downstream can detect.
+        """
+        svc = self._optics()
+        if svc is None:
+            self.failed.emit(
+                "the microscope became unreachable — tile-major capture needs "
+                "it to switch cubes at every tile")
+            return False
+        try:
+            res = svc.ensure_filter(str(plan.channel))
+        except Exception as exc:
+            self.failed.emit(f"cube switch for {plan.channel} failed: {exc}")
+            return False
+        if not getattr(res, "ok", False):
+            why = getattr(res, "why_not", "") or "the cube could not be set"
+            self.failed.emit(f"{plan.channel}: {why}")
+            return False
+        # The recipe the operator dialled in against the histogram.
+        if plan.exposure_us:
+            try:
+                self._cam.set_hw_exposure_us(int(round(plan.exposure_us)))
+            except Exception:
+                pass
+        if plan.gain_pct is not None:
+            try:
+                self._cam.set_hw_exposure_gain(float(plan.gain_pct))
+            except Exception:
+                pass
+        # These two drive _capture_tile, which is shared with the legacy path.
+        self._levels = plan.levels
+        self._avg_frames = int(plan.avg_frames or 1)
+        return True
+
+    def _probe_tile_major(self) -> bool:
+        """One visit to the well centre: focus, then freeze levels PER CHANNEL.
+
+        The probe deliberately visits the CENTRE — tile 0 of a bounding-square
+        raster is empty glass on a circular well, so freezing display levels
+        there would calibrate every channel on background.
+        """
+        if not self._probe_xy:
+            return True
+        try:
+            self._do_probe()
+        except AfCancelled:
+            return False
+        except AfAbort as e:
+            self.failed.emit(str(e))
+            return False
+        for plan in self._channels:
+            if self._stop:
+                return False
+            if not self._select_channel(plan):
+                return False
+            if not self._wait_settled():
+                continue
+            raw = None
+            try:
+                raw = self._cam.capture_raw_average(
+                    1, timeout_s=self._avg_timeout_s())
+            except Exception:
+                raw = None
+            if raw is not None:
+                plan.levels = self._freeze_levels(raw)
+        return True
+
+    def _scan_tile_major(self):
+        """Raster once, capturing every selected channel at each tile."""
+        if not self._probe_tile_major():
+            return
+        if self._stop:
+            return
+        total = len(self._positions)
+        consecutive_none = 0
+        for idx, (tx, ty) in enumerate(self._positions):
+            if self._stop:
+                return
+            try:
+                self._move_to(tx, ty, first=(idx == 0 and not self._probed))
+            except Exception as e:
+                logger.warning(
+                    f"Fluor mosaic: move to ({tx:.0f},{ty:.0f}) failed: {e}")
+            if self._stop:
+                return
+            # ONE focus solve for the tile; every channel is captured at it.
+            # ⚠ Per-channel chromatic (parfocal) offsets are NOT applied — the
+            # documented v7.13 deferral. Within depth of field at 4×/10×.
+            try:
+                self._set_tile_focus(idx, tx, ty)
+            except AfCancelled:
+                return
+            except AfAbort as e:
+                self.failed.emit(str(e))
+                return
+            try:
+                xy = self._controller.get_xy_position(cached=False)
+                sx = xy[0] if xy and xy[0] is not None else tx
+                sy = xy[1] if xy and xy[1] is not None else ty
+            except Exception:
+                sx, sy = tx, ty
+            got_any = False
+            for plan in self._channels:
+                if self._stop:
+                    return
+                if not self._select_channel(plan):
+                    return
+                frame = self._capture_tile()
+                if frame is None:
+                    continue
+                got_any = True
+                plan.builder.add_raster_frame(frame, sx, sy, index=idx)
+                plan.builder.stitch_incremental()
+                plan.frames_used = plan.builder.frame_count
+            if not got_any:
+                consecutive_none += 1
+                if consecutive_none >= self._MAX_CONSEC_NONE:
+                    self.failed.emit(
+                        "camera stopped delivering frames — scan aborted")
+                    return
+                self.progress.emit(idx + 1, total)
+                continue
+            consecutive_none = 0
+            ref = self._channels[0]
+            comp = ref.builder.composite
+            self.tile.emit(comp.copy() if comp is not None else None,
+                           ref.builder.canvas_extent_um)
+            self.progress.emit(idx + 1, total)
+
+        if self._stop:
+            return
+        self._finish_tile_major()
+
+    def _finish_tile_major(self):
+        """Solve the registration ONCE and replay it to every other channel.
+
+        Solving per channel would give each its own positions and its own
+        global shift, so the channels would overlay each other no better than
+        if they had been captured minutes apart — which is precisely what
+        tile-major exists to avoid.
+        """
+        ref = self._channels[0]
+        try:
+            if getattr(ref.builder, "has_reorient_tiles", lambda: False)():
+                ref.builder.optimize_registration(
+                    method=self._registration_method)
+        except Exception as e:
+            logger.debug(f"Fluor mosaic optimize_registration skipped: {e}")
+        try:
+            ref.builder.finalize_global_shift()
+        except Exception as e:
+            logger.debug(f"Fluor mosaic global shift skipped: {e}")
+        for plan in self._channels[1:]:
+            try:
+                plan.builder.apply_registration_from(ref.builder)
+            except Exception as e:
+                logger.warning("Sharing registration to %s failed: %s",
+                               plan.channel, e)
+        for plan in self._channels:
+            composite = plan.builder.composite
+            extent = plan.builder.canvas_extent_um
+            scale = float(getattr(plan.builder, "_mosaic_scale", 0.0) or 0.0)
+            shift = getattr(plan.builder, "_global_shift_um", (0.0, 0.0))
+            self._levels = plan.levels
+            self._avg_used = int(plan.avg_frames or 1)
+            self._exposure_us = float(plan.exposure_us or 0.0)
+            self.channel_done.emit(
+                plan.channel,
+                composite.copy() if composite is not None else None,
+                extent, scale, plan.builder.frame_count, shift,
+                self._build_meta())
+            # Free the float64 accumulators as soon as a channel is handed
+            # over: tile-major holds N composites at once, and at the default
+            # 2500 px canvas that is ~200 MB per channel.
+            try:
+                plan.builder.free_accumulators()
+            except Exception:
+                pass
+        self.finished_all.emit()
+
     def _build_meta(self) -> dict:
         meta = {
             "display_levels": self._levels,
@@ -463,6 +717,13 @@ class _SingleWellMosaicWorker(QThread):
                     return
                 lease_held = True
                 entry_focus = self._af.focus_now_um()
+
+            # v7.19 — tile-major: every colour captured at each tile, sharing
+            # one focus and one registration. The legacy channel-major path
+            # below is untouched and still runs whenever `channels` is unset.
+            if self._channels:
+                self._scan_tile_major()
+                return
 
             try:
                 self._do_probe()
@@ -570,21 +831,11 @@ class _SingleWellMosaicWorker(QThread):
                 pass
 
 
-class _ChannelPill(QPushButton):
-    """Checkable filter-cube pill. Click toggles inclusion; double-click opens
-    the colour picker for the channel's display pseudo-colour."""
-
-    color_requested = Signal()
-
-    def __init__(self, text: str, parent: QWidget | None = None):
-        super().__init__(text, parent)
-        self.setCheckable(True)
-        self.setChecked(True)
-        self.setCursor(Qt.PointingHandCursor)
-
-    def mouseDoubleClickEvent(self, event):
-        self.color_requested.emit()
-        super().mouseDoubleClickEvent(event)
+# v7.19: ``_ChannelPill`` moved to gui/widgets/fluorescence_controls_panel.py
+# with the rest of the cube row. Re-exported (not re-declared) under its old
+# name so existing references keep resolving to the SAME class — two pill
+# classes would be a second, silently diverging definition of "a filter cube
+# in the UI".
 
 
 class _ZoomImageView(QGraphicsView):
@@ -1270,18 +1521,62 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._scan_frame_size = (0, 0)
         self._aborting = False
 
+        # v7.19 — camera state this page forces while it is open, and the
+        # snapshot it restores on the way out. `_entry_hw` subsumes the older
+        # narrower `_entry_exposure_us`: restoring only the exposure left the
+        # operator's auto-exposure/auto-levels/gamma changed behind them.
+        self._entry_hw: dict | None = None
+        self._preset_applied = False
+        self._scan_order = "tile"
+        # v7.19.3 — debounced persistence for the panel's values. 500 ms: long
+        # enough that ⚡Auto's burst of commits is one write, short enough that
+        # a kill -9 loses at most the last gesture.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._flush_recipe_save)
+        # Which cube the OPERATOR says is fitted, used only when there is no
+        # motorised cassette to read. With a body, the body wins.
+        self._manual_active: str | None = None
+
         # Settings popout (scan knobs)
         self._settings_dialog = WorkflowSettingsDialog(
             "fluorescence_mosaic", "Fluorescence Mosaic",
             parent=self, on_change=self._on_settings_changed)
         self._build_settings_dialog(self._settings_dialog)
 
+        # v7.19 — the controls panel. Built BEFORE the layout because it owns
+        # the cube pills and the objective combo, which it publishes back onto
+        # this page under the names every existing method already uses.
+        self._panel = FluorescenceControlsPanel(self)
+        # 🐞 v7.19.3 — the two panel controls that were NOT in the saved
+        # profile. Every other value on the panel round-trips because its widget
+        # is a registered field; the scan order and the camera-preset toggle were
+        # plain attributes with hardcoded defaults, so they silently reset to
+        # "tile" / "fluorescence" on every launch. ``register_external`` is the
+        # v7.7 hook for exactly this: a widget has one parent, so a control
+        # promoted onto the panel cannot also live in a settings section.
+        #
+        # Registered HERE, not in _build_settings_dialog: that runs before the
+        # panel exists, and must stay before it (the panel's constructor calls
+        # back into the page). Both are before load_last(), which is what
+        # restores them.
+        self._settings_dialog.register_external(
+            "scan_order", self._panel.order_combo(), "tile")
+        self._settings_dialog.register_external(
+            "camera_preset_fluor", self._panel.preset_button(), True)
+        self._channel_checks = self._panel.pills()
+        self._objective_combo = self._panel.objective_combo()
+        for ch in fms.CHANNELS:
+            self._apply_pill(ch)
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(s(12), s(10), s(12), s(12))
         outer.setSpacing(s(10))
         if not self._embedded:
             outer.addLayout(self._build_header())
-        # Top row: objective · filter-cube pills · selected well
+        # Top row: the selected well (+ the controls panel inline when embedded,
+        # where there is no left context box of our own to mount it in).
         outer.addWidget(self._build_top_row())
 
         # Main area — three resizable sections:
@@ -1332,6 +1627,14 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         outer.addWidget(main_split, stretch=1)
 
         outer.addWidget(self._build_run_row())
+        # v7.21: a section moved out of ⚙ Settings lands in the drawer, which is
+        # hidden (zero footprint) until something is in it. AFTER the run row on
+        # purpose, so Start / Abort never move.
+        self._promoted_panel = PromotedSectionsPanel()
+        outer.addWidget(self._promoted_panel)
+        self._layout_store = wire_section_promotion(
+            self, self._settings_dialog, self._promoted_panel.stack,
+            settings=self._settings, workflow_id="fluorescence_mosaic")
 
         self._settings_dialog.load_last()
         self._refresh_channel_status()
@@ -1358,33 +1661,23 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         return row
 
     def _build_top_row(self) -> QFrame:
-        """Top row: objective · filter-cube pills (toggle) · selected well."""
+        """Top row: the selected well, plus the controls panel when embedded.
+
+        v7.19: objective, cubes, exposure and the rest moved to the left context
+        panel (:class:`FluorescenceControlsPanel`). An EMBEDDED instance has no
+        left box of its own — the host page owns it with its own jog panel — so
+        the same panel object is mounted here instead. One class, two parents;
+        two separately built surfaces onto one set of settings is the
+        divergence this codebase has paid for before.
+        """
         frame = QFrame(self)
         row = QHBoxLayout(frame)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(s(8))
 
-        row.addWidget(QLabel("Objective:"))
-        self._objective_combo = QComboBox()
-        self._objective_combo.setMinimumWidth(s(100))
-        self._objective_combo.currentTextChanged.connect(self._on_objective_changed)
-        row.addWidget(self._objective_combo)
-
-        sep = QLabel("Filter cubes:")
-        sep.setStyleSheet(f"color: {COLORS['subtext0']};")
-        row.addSpacing(s(10))
-        row.addWidget(sep)
-        for ch in fms.CHANNELS:
-            pill = _ChannelPill(ch)
-            pill.setToolTip(
-                f"{ch}: click to include in the capture, double-click to set "
-                f"its display colour.")
-            pill.toggled.connect(
-                lambda _checked, c=ch: self._on_pill_toggled(c))
-            pill.color_requested.connect(lambda c=ch: self._pick_color(c))
-            self._channel_checks[ch] = pill
-            self._apply_pill(ch)
-            row.addWidget(pill)
+        if self._embedded:
+            row.addWidget(self._panel, stretch=1)
+            row.addSpacing(s(10))
 
         row.addStretch(1)
         row.addWidget(QLabel("Well:"))
@@ -1405,6 +1698,487 @@ class FluorescenceMosaicWorkflowPage(QWidget):
     def _on_pill_toggled(self, channel: str):
         self._apply_pill(channel)
         self._update_button_state()
+
+    # ── Left context panel (v7.19) ────────────────────────────────
+
+    def get_context_widget(self):
+        """The workflow's own left context panel — or None when embedded.
+
+        An embedded instance must return None: its HOST owns the left box (with
+        its own jog panel), and handing this panel over would either steal that
+        box or mount the same widget in two places at once. The embedded case
+        shows the panel inline in the top row instead.
+        """
+        if self._embedded:
+            return None
+        return self._panel
+
+    def context_label(self) -> str:
+        """Name for the left box's native pill — these are not jog controls."""
+        return "Signal"
+
+    # -- the panel's page API (see FluorescenceControlsPanel._PAGE_API) --
+
+    def channels(self) -> tuple:
+        return tuple(fms.CHANNELS)
+
+    def camera_manager_for_panel(self):
+        return self._camera_manager
+
+    def microscope_cam_idx(self) -> int:
+        return self._resolve_microscope_cam_idx()
+
+    def on_panel_pill_toggled(self, channel: str):
+        self._on_pill_toggled(channel)
+
+    def on_panel_pick_colour(self, channel: str):
+        self._pick_color(channel)
+
+    def on_panel_objective_changed(self, name: str):
+        self._on_objective_changed(name)
+
+    def on_panel_scan_order_changed(self, order: str):
+        self._scan_order = str(order or "tile")
+        self._schedule_recipe_save()
+
+    def scan_order(self) -> str:
+        """Read the COMBO, not a mirror of it.
+
+        v7.19.3: ``_scan_order`` was a page attribute updated by the panel's
+        change handler. Once the combo is a restored settings field there are
+        two ways it can move — an operator pick and ``apply()`` — and only one
+        of them was guaranteed to update the mirror. The widget is the value.
+        """
+        panel = getattr(self, "_panel", None)
+        if panel is not None:
+            try:
+                return panel.scan_order()
+            except Exception:
+                pass
+        return getattr(self, "_scan_order", "tile")
+
+    # -- the per-channel signal recipe -------------------------------
+
+    #: recipe key -> (spin dict attribute, unit conversion spin→recipe).
+    #: Exposure is held in µs everywhere in the camera stack but typed in ms.
+    _RECIPE_SPINS = {
+        "exposure_us": ("_channel_exposure", 1000.0),
+        "gain_pct": ("_channel_gain", 1.0),
+        "avg_frames": ("_channel_avg", 1.0),
+        "display_lo": ("_channel_lo", 1.0),
+        "display_hi": ("_channel_hi", 1.0),
+    }
+
+    def _recipe_spin(self, channel: str, key: str):
+        attr, _scale = self._RECIPE_SPINS.get(key, (None, 1.0))
+        if attr is None:
+            return None
+        return getattr(self, attr, {}).get(channel)
+
+    def channel_recipe(self, channel: str) -> dict:
+        """This channel's signal recipe, in the camera stack's own units.
+
+        A zero means "not set": the exposure/gain are left as the camera has
+        them, averaging falls back to the shared scan setting, and the display
+        levels are measured at the probe. That is the same ``0 = default``
+        convention the exposure spin has used since v7.13, extended to the
+        controls added beside it.
+        """
+        out: dict = {}
+        for key, (attr, scale) in self._RECIPE_SPINS.items():
+            spin = getattr(self, attr, {}).get(channel)
+            if spin is None:
+                continue
+            try:
+                val = float(spin.value()) * scale
+            except Exception:
+                continue
+            if val > 0:
+                out[key] = val
+        return out
+
+    def _schedule_recipe_save(self):
+        """Persist the panel's values shortly after the last edit.
+
+        🐞 v7.19.3, operator: *"the values assigned here should be persistant on
+        this page"*. They were being WRITTEN into the right widgets — every
+        recipe spin is a registered settings field — but nothing ever wrote the
+        file. ``WorkflowSettingsDialog.save_last`` is reached only from that
+        dialog's own ``hideEvent``/``closeEvent``, and the page hides the popout
+        only ``if self._settings_dialog.isVisible()``. So the save ran only for
+        an operator who OPENED the ⚙ popout and closed it again — and the whole
+        point of the v7.19 panel is that they no longer need to. Every slider
+        change was lost on restart.
+
+        Debounced rather than written per commit: the slider already debounces
+        at 300 ms, but ⚡Auto and a channel switch can commit several values in a
+        burst, and the v7.16 camera-crop incident is the recorded cost of a JSON
+        write per widget step.
+        """
+        try:
+            self._save_timer.start()
+        except Exception:
+            pass
+
+    def _flush_recipe_save(self):
+        """Write now. Called on the debounce and on the way off the page."""
+        try:
+            self._save_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._settings_dialog.save_last()
+        except Exception as exc:
+            logger.debug("fluor: save_last failed: %s", exc)
+
+    def set_channel_recipe(self, channel: str, key: str, value: float):
+        """Record an ACHIEVED value into the persisted recipe.
+
+        Called by the panel after the camera has adopted a slider change, so
+        the stored number is what the camera ran, not what was asked for.
+        Writing under blockSignals keeps the popout's own change handler from
+        treating this as an operator edit and re-entering the apply path.
+        """
+        spin = self._recipe_spin(channel, key)
+        if spin is None:
+            return
+        _attr, scale = self._RECIPE_SPINS[key]
+        blocked = spin.blockSignals(True)
+        try:
+            scaled = float(value) / scale
+            # QSpinBox is integral (averaging, raw display counts);
+            # QDoubleSpinBox is not (exposure ms, gain %).
+            spin.setValue(int(round(scaled)) if isinstance(spin, QSpinBox)
+                          else scaled)
+        except Exception as exc:
+            logger.debug("fluor: recipe write %s/%s failed: %s",
+                         channel, key, exc)
+        finally:
+            spin.blockSignals(blocked)
+        # blockSignals above is what stops the popout treating this as an
+        # operator edit — and it is also what stops `notify_on_field_change`
+        # ever firing, so the save has to be asked for explicitly here.
+        self._schedule_recipe_save()
+
+    def apply_panel_control(self, key: str, value: float):
+        """Push ONE signal control to the microscope camera; return what it took.
+
+        Returning the ACHIEVED value is the contract the panel's readout relies
+        on — a camera that clamps a request must not leave the UI showing the
+        request (the v7.13 "exposure resets itself" report was exactly that).
+        """
+        mgr = self._camera_manager
+        if mgr is None:
+            return None
+        cam = self._resolve_microscope_cam_idx()
+        try:
+            if key == "exposure_us":
+                mgr.set_hw_exposure_us(cam, int(round(float(value))))
+            elif key == "gain_pct":
+                mgr.set_hw_exposure_gain(cam, float(value))
+            elif key == "avg_frames":
+                # Averaging is ours, not the camera's — nothing to push.
+                return float(value)
+            elif key == "display_lo":
+                mgr.set_hw_andor_scale_lo(cam, int(round(float(value))))
+            elif key == "display_hi":
+                mgr.set_hw_andor_scale_hi(cam, int(round(float(value))))
+            else:
+                return None
+        except Exception as exc:
+            logger.debug("fluor panel: apply %s failed: %s", key, exc)
+            return None
+        return self._readback_control(key)
+
+    def _readback_control(self, key: str):
+        """Re-read one control FROM the camera; None when it cannot be read."""
+        mgr = self._camera_manager
+        if mgr is None or not hasattr(mgr, "get_hw_settings"):
+            return None
+        try:
+            st = mgr.get_hw_settings(self._resolve_microscope_cam_idx()) or {}
+        except Exception:
+            return None
+        got = st.get({"exposure_us": "exposure_us",
+                      "gain_pct": "exposure_gain_pct",
+                      "display_lo": "andor_scale_lo",
+                      "display_hi": "andor_scale_hi"}.get(key, ""))
+        try:
+            return float(got) if got is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def run_auto_exposure(self, channel: str):
+        """⚡Auto — step the exposure until the signal sits just below clipping.
+
+        Deliberately exposure-ONLY and deliberately the existing, bench-verified
+        ``run_signal_optimize``: gain trades signal-to-noise and averaging
+        trades time and light dose, so neither should be spent automatically on
+        the operator's behalf. ``freeze_display=False`` because the scan freezes
+        its own capture levels at the probe.
+        """
+        mgr = self._camera_manager
+        if mgr is None:
+            return None
+        try:
+            from gui.widgets.mono_display import run_signal_optimize
+            res = run_signal_optimize(
+                mgr, self._resolve_microscope_cam_idx(), freeze_display=False)
+        except Exception as exc:
+            logger.debug("fluor panel: auto exposure failed: %s", exc)
+            return None
+        got = None
+        if isinstance(res, dict):
+            got = res.get("exposure_us")
+        return float(got) if got else self._readback_control("exposure_us")
+
+    # -- the camera preset -------------------------------------------
+
+    def _panel_caps(self) -> dict:
+        mgr = self._camera_manager
+        if mgr is None or not hasattr(mgr, "hardware_capabilities"):
+            return {}
+        try:
+            return mgr.hardware_capabilities(
+                self._resolve_microscope_cam_idx()) or {}
+        except Exception:
+            return {}
+
+    def _capture_entry_hw(self):
+        """Snapshot the camera as the operator left it, once per visit.
+
+        Taken BEFORE the preset is applied and never overwritten while the page
+        stays open, so toggling the preset back and forth cannot slowly turn the
+        operator's own settings into the preset's.
+        """
+        if self._entry_hw is not None:
+            return
+        mgr = self._camera_manager
+        if mgr is None or not hasattr(mgr, "get_hw_settings"):
+            return
+        try:
+            self._entry_hw = hw_controls_snapshot(
+                mgr.get_hw_settings(self._resolve_microscope_cam_idx()) or {})
+        except Exception as exc:
+            logger.debug("fluor: entry camera snapshot failed: %s", exc)
+            self._entry_hw = None
+
+    def _apply_camera_preset(self):
+        """Force the camera into the state a quantitative mosaic needs."""
+        mgr = self._camera_manager
+        if mgr is None:
+            return
+        preset = fluorescence_preset(self._panel_caps())
+        if not preset:
+            return
+        apply_hw_controls(mgr, self._resolve_microscope_cam_idx(), preset,
+                          skip_resolution=True)
+        self._preset_applied = True
+        logger.info("Fluorescence camera preset applied: %s",
+                    ", ".join(sorted(preset)))
+
+    def _restore_entry_hw(self):
+        """Put the camera back exactly as this page found it.
+
+        Nothing here is written to CameraCalibrationStore: the preset is a mode
+        this workflow runs IN, not a change to the camera's saved configuration.
+        """
+        mgr = self._camera_manager
+        if mgr is None or not self._entry_hw:
+            self._preset_applied = False
+            return
+        apply_hw_controls(mgr, self._resolve_microscope_cam_idx(),
+                          self._entry_hw, skip_resolution=True)
+        self._preset_applied = False
+
+    def on_panel_camera_preset_changed(self, fluorescence: bool):
+        if self.is_scanning():
+            return
+        if fluorescence:
+            self._capture_entry_hw()
+            self._apply_camera_preset()
+        else:
+            self._restore_entry_hw()
+        try:
+            self._panel.refresh_ranges()
+        except Exception:
+            pass
+        self._schedule_recipe_save()
+
+    # -- which optics are ACTUALLY in the light path -----------------
+
+    def _scope_state(self):
+        """The microscope's cached state, or None. Never raises, never blocks.
+
+        Lazy import: this page must keep working on a rig with no microscope
+        SDK installed at all.
+        """
+        try:
+            from SupportClasses.MicroscopeControl import get_microscope
+            return get_microscope().state()
+        except Exception:
+            return None
+
+    def _cube_slots(self, state) -> tuple[dict, dict]:
+        """``({channel: slot}, {channel: refusal})`` for every channel.
+
+        Resolution goes through ``FluorescenceMosaicStore.channel_slot``, which
+        matches exact → normalized → operator alias → the body's own name and
+        REFUSES rather than guessing.
+
+        ⚠ Not ``channel_number``: that is an acquisition ORDINAL, and this rig's
+        slot 3 holds TxRed while the ordinal calls it mCherry. A TxRed image
+        filed as mCherry is a result nothing downstream can detect.
+        """
+        slots: dict[str, int] = {}
+        refusals: dict[str, str] = {}
+        try:
+            from SupportClasses.MicroscopeConfigStore import get_store as _cfg
+            cfg = _cfg()
+        except Exception:
+            cfg = None
+        for ch in fms.CHANNELS:
+            try:
+                match = fms.channel_slot(ch, scope_state=state, config_store=cfg)
+            except Exception:
+                match = None
+            if match is not None and getattr(match, "ok", False):
+                slots[ch] = int(getattr(match, "position", 0))
+            else:
+                refusals[ch] = (getattr(match, "why_not", "") if match else "")\
+                    or f"no filter cube is configured for {ch}"
+        return slots, refusals
+
+    def panel_optics_state(self) -> dict:
+        """What the panel renders: which cube and objective are really fitted.
+
+        The active channel is a HARDWARE READ, not a flag this page maintains —
+        the operator can turn the cassette by hand, and a panel that kept its
+        own idea of "active" would enable the wrong channel's sliders and
+        record an exposure against the wrong cube.
+
+        With no microscope the operator's own last pick stands (their decision,
+        per the "manual turret" case), and the note says so rather than
+        pretending a position was read.
+        """
+        state = self._scope_state()
+        slots, refusals = self._cube_slots(state)
+        connected = bool(getattr(state, "connected", False))
+        has_filter = bool(getattr(state, "has_filter", False))
+        note = ""
+        active = None
+        if connected and has_filter:
+            pos = getattr(state, "filter_position", None)
+            for ch, slot in slots.items():
+                if pos and slot == pos:
+                    active = ch
+                    break
+            if active is None:
+                note = (f"Cassette position {pos} is not bound to any channel — "
+                        f"bind it on Hardware Setup → Microscope.")
+        else:
+            active = self._manual_active or (self._selected_channels() or [None])[0]
+            # Without a body nothing can be driven, so every cube is "manual".
+            refusals = {}
+            note = ("No motorised cassette: set the cube by hand, then pick it "
+                    "here so its controls apply to the right channel.")
+        return {
+            "active_channel": active,
+            "objective": self._live_objective_name(),
+            "cube_refusals": refusals,
+            "note": note,
+        }
+
+    def _live_objective_name(self) -> str:
+        """The objective the BODY has, falling back to the declared one.
+
+        🐞 v7.19.2, operator: *"flourescence mosaic is not autodetecting the
+        objective and the current filter. I changed both and it did not
+        update."* The cube half was a real hardware read all along
+        (``filter_position``); the objective half returned
+        ``_current_objective_name()`` — i.e. ``camera_config
+        .current_objective_name``, the app's OWN declared value. The panel was
+        therefore comparing its combo against a copy of itself and could never
+        detect a nosepiece anyone else had moved. It is not that the update was
+        slow: nothing was being read.
+        """
+        try:
+            state = self._scope_state()
+            if getattr(state, "connected", False):
+                from SupportClasses.OpticsRegistry import OBJECTIVE, optic_at
+                optic = optic_at(
+                    state, getattr(state, "objective_position", None), OBJECTIVE)
+                name = str(getattr(optic, "label", "") or "")
+                if name:
+                    return name
+        except Exception:
+            pass
+        return self._current_objective_name()
+
+    def on_panel_objective_detected(self, name: str):
+        """The body reports an objective we were not using. Follow it.
+
+        Called from the panel's poll when the nosepiece has been turned by hand
+        or by another surface. This ADOPTS — declares the name and pushes its
+        calibrated µm/px — and deliberately does NOT drive: the turret is
+        already where it is, and commanding it would be an unasked-for move.
+
+        ⚠ This is the one poll-driven write of ``current_objective_name``, and
+        it is legitimate for a reason worth stating: the alternative is to know
+        the objective changed and go on scaling every tile by the old one's
+        µm/px, which is the silent scale error this whole area exists to
+        prevent. What v7.18 forbids is a background write of a DERIVED or
+        guessed value; this is a verified read-back of what is physically
+        fitted, and the hardware is the authority on that.
+        """
+        if not name or self.is_scanning():
+            return
+        if name == self._current_objective_name():
+            return
+        logger.info("Objective changed on the body to %s — adopting its µm/px.",
+                    name)
+        self._adopt_objective(name)
+
+    def on_panel_activate_channel(self, channel: str):
+        """Put ``channel``'s cube in the light path.
+
+        Rotating the cassette needs no collision guard — it moves no objective
+        and changes no height, which is why filter automation is the safe half
+        of driving the optics.
+
+        With no motorised cassette this records the operator's word instead:
+        they told us what they fitted, and that is the only source there is.
+        """
+        if self.is_scanning():
+            return
+        # Held either way: with no body it IS the answer, and with a body it is
+        # a harmless fallback if the read later fails.
+        self._manual_active = channel
+        try:
+            from gui.widgets.optics_ensure import ensure_optics_async
+            ensure_optics_async(kind="filter", name=str(channel),
+                                on_done=self._on_cube_ensured)
+        except Exception:
+            pass
+        try:
+            self._panel.refresh_optics()
+        except Exception:
+            pass
+
+    def _on_cube_ensured(self, result):
+        """GUI thread: report the cube switch and re-read the light path."""
+        if result is not None:
+            if getattr(result, "ok", False):
+                logger.info("Filter cube: %s", result.describe())
+            else:
+                from gui.widgets.optics_ensure import describe_refusal
+                why = describe_refusal(result)
+                logger.warning("Cube switch refused: %s", why)
+                self._status.setText(f"Filter cube NOT changed — {why}")
+        try:
+            self._panel.refresh_optics()
+        except Exception:
+            pass
 
     def _build_run_row(self) -> QFrame:
         frame = QFrame(self)
@@ -1472,23 +2246,68 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         note.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         sec.add_widget(note)
 
-        # ── v7.13: per-channel exposure ───────────────────────────
+        # ── v7.13/v7.19: the per-channel SIGNAL RECIPE ────────────
+        #
+        # These spins are the persistence layer (WorkflowSettingsStore gives
+        # profiles, import/export and last-used for free, so a "dim sample"
+        # recipe set is saveable). The left-panel sliders are a SECOND VIEW of
+        # exactly these widgets — see `_recipe_spin` / `set_channel_recipe`.
+        # There is deliberately no third store.
         chan = dlg.add_section("Channels")
         chan.add_note(
-            "Exposure applied when each channel's scan starts (also editable "
-            "in the per-channel filter prompt, where it applies live). "
-            "0 = leave the camera as it is. Recorded with each saved channel.")
+            "The signal recipe for each filter cube, applied when that "
+            "channel is captured and recorded with the saved mosaic. Editable "
+            "here or, live against the histogram, on the Signal panel. "
+            "0 = leave the camera as it is.")
         self._channel_exposure: dict[str, QDoubleSpinBox] = {}
+        self._channel_gain: dict[str, QDoubleSpinBox] = {}
+        self._channel_avg: dict[str, QSpinBox] = {}
+        self._channel_lo: dict[str, QSpinBox] = {}
+        self._channel_hi: dict[str, QSpinBox] = {}
         for ch in fms.CHANNELS:
+            tok = fms._safe_token(ch).lower()
             spin = QDoubleSpinBox()
             spin.setDecimals(2)
-            spin.setRange(0.0, 10000.0)
+            spin.setRange(0.0, 600000.0)
             spin.setSuffix(" ms")
             spin.setSpecialValueText("camera default")
             spin.setValue(0.0)
-            key = f"exposure_ms_{fms._safe_token(ch).lower()}"
-            chan.add(key, f"{ch} exposure", spin, 0.0)
+            chan.add(f"exposure_ms_{tok}", f"{ch} exposure", spin, 0.0)
             self._channel_exposure[ch] = spin
+
+            gain = QDoubleSpinBox()
+            gain.setDecimals(1)
+            gain.setRange(0.0, 100.0)
+            gain.setSuffix(" %")
+            gain.setSpecialValueText("camera default")
+            chan.add(f"gain_pct_{tok}", f"{ch} gain", gain, 0.0)
+            self._channel_gain[ch] = gain
+
+            avg = QSpinBox()
+            avg.setRange(0, 64)
+            avg.setSpecialValueText("scan default")
+            avg.setToolTip(
+                "Frames averaged per tile. Real √N signal-to-noise, at N× the "
+                "time AND N× the light dose. 0 uses the shared scan setting.")
+            chan.add(f"avg_frames_{tok}", f"{ch} averaging", avg, 0)
+            self._channel_avg[ch] = avg
+
+            lo = QSpinBox()
+            lo.setRange(0, 65535)
+            lo.setSpecialValueText("auto (measured at the probe)")
+            lo.setToolTip(
+                "Display black point in raw counts. Set explicitly and it is "
+                "also used as the CAPTURE level, so the saved mosaic looks "
+                "like the preview did; left at 0 the scan measures it at the "
+                "well centre.")
+            chan.add(f"disp_lo_{tok}", f"{ch} black", lo, 0)
+            self._channel_lo[ch] = lo
+
+            hi = QSpinBox()
+            hi.setRange(0, 65535)
+            hi.setSpecialValueText("auto (measured at the probe)")
+            chan.add(f"disp_hi_{tok}", f"{ch} white", hi, 0)
+            self._channel_hi[ch] = hi
 
         # ── v7.13: per-tile autofocus (the sample's critical surface) ──
         af = dlg.add_section("Autofocus (per tile)")
@@ -1662,8 +2481,9 @@ class FluorescenceMosaicWorkflowPage(QWidget):
     def get_sub_page_title(self) -> str:
         return "Fluorescence Mosaic"
 
-    def get_context_widget(self):
-        return None
+    # v7.19: get_context_widget lives above, with the rest of the panel bridge.
+    # It used to return None here — a SECOND definition later in the class,
+    # which silently won and left the workflow with no left box at all.
 
     def on_status_update(self) -> None:
         pass
@@ -1673,6 +2493,15 @@ class FluorescenceMosaicWorkflowPage(QWidget):
 
     def showEvent(self, event):
         self._start_camera()
+        # v7.19 — take the camera as the operator left it, THEN force the
+        # fluorescence preset. Order matters: snapshotting after the preset
+        # would make "Camera defaults" restore the preset itself.
+        self._capture_entry_hw()
+        if self._panel.preset_is_fluorescence():
+            self._apply_camera_preset()
+        self._panel.refresh_ranges()
+        self._panel.load_recipes()
+        self._panel.start_polling()
         # Draw the planned-raster preview once now and again shortly after, so it
         # appears as soon as the camera starts delivering frames (needed for the
         # FOV/grid sizing).
@@ -1680,11 +2509,24 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         try:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(900, self._refresh_grid_preview)
+            # The camera may not be delivering (or advertising its ranges) yet.
+            QTimer.singleShot(900, self._panel.refresh_ranges)
         except Exception:
             pass
         super().showEvent(event)
 
     def hideEvent(self, event):
+        # Flush any debounced slider edit BEFORE restoring, or the pending
+        # write would land on the camera after it had been put back.
+        try:
+            self._panel.stop_polling()      # flushes any pending slider edit
+        except Exception:
+            pass
+        # ...so the values written by that flush are in the widgets before this
+        # writes them out. Reversing these two loses the last edit every time.
+        self._flush_recipe_save()
+        self._restore_entry_hw()
+        self._entry_hw = None
         self._stop_camera()
         try:
             if self._settings_dialog.isVisible():
@@ -2019,11 +2861,22 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                 f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
 
     def _refresh_objectives(self):
-        try:
-            from SupportClasses.ObjectiveCalibration import get_store as obj_store
-            names = obj_store().objective_names()
-        except Exception:
-            names = []
+        """Fill the objective combo, preferring the NOSEPIECE's own slots.
+
+        v7.19: the combo now drives the turret, so it must offer the things the
+        turret can actually be driven to — the named positions from Hardware
+        Setup → Microscope, in turret order. The calibration store's list is
+        kept as the fallback for a rig with no microscope configured, which is
+        exactly what it was before this change.
+        """
+        names = self._nosepiece_objective_names()
+        if not names:
+            try:
+                from SupportClasses.ObjectiveCalibration import (
+                    get_store as obj_store)
+                names = list(obj_store().objective_names())
+            except Exception:
+                names = []
         current = ""
         cfg = self._hw_config
         if cfg is not None:
@@ -2042,16 +2895,194 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         # calibrated µm/px (+ resolution stamp) to the manager explicitly so
         # effective_um_per_px is correct app-wide (it's guarded / a no-op when
         # the objective has no stored calibration).
+        #
+        # 🔴 v7.19.1 — this used to call ``_on_objective_changed`` and MUST NOT.
+        # That was correct while the handler was a software relabel, but v7.19
+        # gave it a second job: it now calls ``_drive_objective``, which fires
+        # ``ensure_optics_async`` and PHYSICALLY ROTATES THE NOSEPIECE. This
+        # function runs from ``set_hardware_config`` — a config load, not an
+        # operator click — so loading a saved setup would have commanded a
+        # turret rotation nobody asked for.
+        #
+        # ``_adopt_objective`` is exactly the half this line ever wanted: record
+        # the name, push its µm/px, touch no hardware.
         cur = self._objective_combo.currentText()
         if cur:
-            self._on_objective_changed(cur)
+            self._adopt_objective(cur)
 
     def _on_objective_changed(self, name: str):
-        """Push the objective's calibrated µm/px (+ rotation) to the camera
-        manager and record it as the current objective — mirrors the Hardware
-        Setup objective card so the mosaic scale is correct."""
+        """Rotate the nosepiece to ``name``, then adopt its calibrated µm/px.
+
+        v7.19, operator: *"when i select a different objective at the top, it
+        should change the objective if the microscope is connected"*. Until now
+        this was a SOFTWARE RELABEL only — picking 20x on a body sitting at 4x
+        silently rescaled every tile of the next mosaic.
+
+        Three cases, and the difference between them is the whole point:
+
+        * **A scan is running** → refused. The run freezes its raster positions
+          and µm/px once and replays them for every channel, so changing the
+          objective mid-run leaves the tile spacing not matching the field of
+          view — the v7.16 seam failure by another route.
+        * **A drivable body** → ``ensure_objective``, which retreats the focus
+          first (rotation does not move Z, so a height that clears a 4x can be
+          inside a 20x's front lens) and verifies the new position by read-back.
+          A refusal REVERTS the combo, because a combo showing an objective that
+          is not in the light path is the bug this change exists to remove.
+        * **No body, or a manual turret** → the operator's pick stands. They
+          told us what they fitted, and on a manual turret that is the only
+          source there is.
+
+        Only this last, operator-initiated GUI-thread path writes
+        ``current_objective_name``; nothing automatic or polled does.
+        """
         if not name:
             return
+        if self.is_scanning():
+            logger.info("Objective change refused: a scan is running.")
+            self._revert_objective_combo()
+            self._status.setText(
+                "Objective unchanged — a capture is running. The raster is "
+                "planned for the objective it started with.")
+            return
+        self._drive_objective(name)
+        self._adopt_objective(name)
+
+    def _nosepiece_objective_names(self) -> list[str]:
+        """Named nosepiece positions, in turret order. ``[]`` when unconfigured.
+
+        The operator's slot label is what ``OpticsRegistry`` resolves and what
+        ``ObjectiveCalibration`` is keyed by — the two already join by string,
+        case-insensitively, so a panel labelled ``4X`` finds the ``4x``
+        calibration with no store rewrite.
+        """
+        try:
+            from SupportClasses.MicroscopeConfigStore import get_store as _cfg
+            from SupportClasses.OpticsRegistry import OBJECTIVE, resolve_slots
+            slots = resolve_slots(scope_state=self._scope_state(),
+                                  config_store=_cfg(), kind=OBJECTIVE)
+        except Exception:
+            return []
+        return [str(sl.name) for sl in sorted(slots, key=lambda x: x.position)
+                if getattr(sl, "name", "")]
+
+    def _drive_objective(self, name: str):
+        """Ask the body for ``name``; no-op when it cannot be driven."""
+        try:
+            from gui.widgets.optics_ensure import ensure_optics_async
+        except Exception:
+            return
+        ensure_optics_async(
+            kind="objective", name=str(name),
+            glass_focus_um=self._glass_focus_um(),
+            needle_retracted=self._needle_is_retracted(),
+            on_done=self._on_objective_ensured)
+
+    def _glass_focus_um(self):
+        """Focus reading at which the plate glass is sharp, if it is known.
+
+        Comes from the v7.11 optical datum (``PlateFocusDatumStore``), measured
+        for THIS camera + objective + plate. ``ensure_objective`` refuses to
+        rotate without it rather than rotating hopefully: it is what turns a
+        focus position into a gap between the front lens and the glass, and so
+        what decides whether a 20x (WD ~1 mm) may be rotated in at all.
+
+        Absent is a legitimate answer — the operator simply gets the refusal
+        naming what to measure, which is far better than a guessed clearance.
+        """
+        try:
+            from SupportClasses.PlateFocusDatumStore import get_store
+            ident = self._camera_key()
+            obj = self._current_objective_name()
+            plate = self._plate_key()
+            if not (ident and obj and plate):
+                return None
+            rec = get_store().get(str(ident), str(obj), plate) or {}
+            val = rec.get("focus_um_at_bottom")
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def _needle_is_retracted(self):
+        """True/False when it can be judged, None when it cannot.
+
+        ``ensure_objective`` refuses outright on False, so "unknown" must NOT
+        be reported as False — that would block every rotation on a rig with no
+        Z board connected, where there is no needle to endanger.
+        """
+        ctrl = self._controller
+        if ctrl is None or self._safe_z is None:
+            return None
+        try:
+            if not getattr(ctrl, "is_zp_connected", False):
+                return None
+            pos = ctrl.get_zp_position_zero_ref() or {}
+            cur = pos.get("Z")
+            if cur is None:
+                return None
+            return bool(ctrl.needle_at_or_above(float(cur),
+                                                float(self._safe_z)))
+        except Exception:
+            return None
+
+    def _on_objective_ensured(self, result):
+        """GUI thread: report, and revert the combo if nothing moved."""
+        if result is None:
+            # No body at all — the operator's pick stands (manual turret).
+            logger.info("Objective set as a label: no microscope to drive.")
+            return
+        if getattr(result, "ok", False):
+            note = result.describe()
+            logger.info("Objective: %s", note)
+            if getattr(result, "simulated", False):
+                self._status.setText(f"Objective {note}")
+            return
+        from gui.widgets.optics_ensure import describe_refusal
+        why = describe_refusal(result)
+        logger.warning("Objective switch refused: %s", why)
+        real = self._revert_objective_combo()
+        # 🔴 v7.19.1 — reverting the COMBO is not enough, and the gap was the
+        # silent-scale-error class this whole area exists to prevent.
+        # ``ensure_optics_async`` is asynchronous, so ``_adopt_objective`` has
+        # ALREADY run by the time a refusal lands: ``current_objective_name``
+        # and the µm/px pushed into CameraManager are both sitting on the
+        # objective that never entered the light path. Reverting only the combo
+        # left the screen right and the numbers wrong — the worst arrangement,
+        # because nothing on screen disagrees. Re-adopt what the body actually
+        # has.
+        if real:
+            self._adopt_objective(real)
+        self._status.setText(f"Objective NOT changed — {why}")
+
+    def _revert_objective_combo(self) -> str:
+        """Show the objective that is actually in the light path.
+
+        Returns its name so the caller can put the DECLARED objective and the
+        pushed µm/px back on it too — see ``_on_objective_ensured``.
+        """
+        real = ""
+        try:
+            state = self._scope_state()
+            from SupportClasses.OpticsRegistry import OBJECTIVE, optic_at
+            optic = optic_at(state, getattr(state, "objective_position", None),
+                             OBJECTIVE)
+            real = str(getattr(optic, "label", "") or "")
+        except Exception:
+            real = ""
+        if not real:
+            return ""
+        idx = self._objective_combo.findText(real)
+        if idx < 0:
+            return real
+        blocked = self._objective_combo.blockSignals(True)
+        try:
+            self._objective_combo.setCurrentIndex(idx)
+        finally:
+            self._objective_combo.blockSignals(blocked)
+        return real
+
+    def _adopt_objective(self, name: str):
+        """Record ``name`` as current and push its calibrated µm/px."""
         cfg = self._hw_config
         if cfg is not None and hasattr(cfg, "camera_config"):
             try:
@@ -2543,13 +3574,20 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         fw, fh = plan["frame_size"]
 
         n_tiles = len(grid)
-        est_min = n_tiles * len(channels) * 1.5 / 60.0
+        # v7.19 — tile-major needs every selected channel's cube to be
+        # resolvable AND drivable. A 400-tile well cannot pause for a human
+        # 1200 times, so this is settled BEFORE the run, not discovered at
+        # tile 1. Falling back to channel-major is always offered.
+        order = self.scan_order()
+        if order == "tile":
+            blockers = self._tile_major_blockers(channels)
+            if blockers:
+                order = self._offer_channel_major(blockers)
+                if order is None:
+                    return
+        body, tile_major = self._describe_run_cost(plan, channels, order)
         proceed = QMessageBox.question(
-            self, "Fluorescence mosaic",
-            f"This will raster {n_tiles} tiles ({plan['cols']}×{plan['rows']}) per "
-            f"channel × {len(channels)} channel(s) (~{est_min:.0f} min total). "
-            f"You'll be prompted to switch the filter between channels. The needle "
-            f"stays retracted at Safe Z.\n\nStart?",
+            self, "Fluorescence mosaic", body,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if proceed != QMessageBox.StandardButton.Yes:
@@ -2597,7 +3635,173 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._run_af_summary = None
         self._scan_exposure_us = 0.0
         self._start_camera()
-        self._prompt_next_channel()
+        if tile_major:
+            self._start_tile_major_run(channels)
+        else:
+            self._prompt_next_channel()
+
+    # ── v7.19: tile-major run planning ────────────────────────────
+
+    def _tile_major_blockers(self, channels: list[str]) -> list[str]:
+        """Channels whose cube cannot be driven, each with its reason.
+
+        Empty means tile-major can run unattended.
+        """
+        state = self._scope_state()
+        if not getattr(state, "connected", False) \
+                or not getattr(state, "has_filter", False):
+            return ["no motorised filter cassette is connected — every cube "
+                    "change would need a person"]
+        _slots, refusals = self._cube_slots(state)
+        return [f"{ch}: {refusals[ch]}" for ch in channels if ch in refusals]
+
+    def _offer_channel_major(self, blockers: list[str]):
+        """Ask whether to fall back. Returns ``"channel"`` or None to cancel."""
+        detail = "\n".join(f"  • {b}" for b in blockers)
+        answer = QMessageBox.question(
+            self, "Fluorescence mosaic",
+            "Every colour per tile needs the cassette to be switched "
+            "automatically at every tile, and these channels cannot be:\n\n"
+            f"{detail}\n\n"
+            "Capture a full scan per colour instead? You will be prompted to "
+            "change the cube between channels.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        return "channel" if answer == QMessageBox.StandardButton.Yes else None
+
+    def _describe_run_cost(self, plan, channels, order) -> tuple[str, bool]:
+        """The confirm text, priced honestly. ``(body, tile_major)``."""
+        n_tiles = len(plan["grid"])
+        n_ch = len(channels)
+        tile_major = (order == "tile")
+        head = (f"This will raster {n_tiles} tiles "
+                f"({plan['cols']}×{plan['rows']}) capturing "
+                f"{n_ch} channel(s).\n\n")
+        if tile_major:
+            rotations = n_tiles * n_ch
+            # ~1.5 s per capture as before, plus ~1.5 s per cube rotation.
+            est_min = (n_tiles * n_ch * 1.5 + rotations * 1.5) / 60.0
+            mem_mb = self._composite_mb(plan) * n_ch
+            body = (
+                head +
+                f"Order: EVERY COLOUR PER TILE — the channels share one focus "
+                f"and one registration, so they overlay exactly.\n\n"
+                f"Cost: {rotations} cube rotations (~{est_min:.0f} min total), "
+                f"and roughly {mem_mb:.0f} MB held while it runs "
+                f"({n_ch} composites at once).\n\n"
+                f"The needle stays retracted at Safe Z.\n\nStart?")
+        else:
+            est_min = n_tiles * n_ch * 1.5 / 60.0
+            body = (
+                head +
+                f"Order: FULL SCAN PER COLOUR (~{est_min:.0f} min total). "
+                f"Each channel is captured minutes after the last, so they "
+                f"register only as well as the stage repeats.\n\n"
+                f"The needle stays retracted at Safe Z.\n\nStart?")
+        return body, tile_major
+
+    def _composite_mb(self, plan) -> float:
+        """Rough float64 accumulator cost of ONE channel's composite, in MB.
+
+        The composite is not final until its last tile, so tile-major genuinely
+        holds N of these at once — worth stating before a long run rather than
+        discovering as a swap storm.
+        """
+        try:
+            px = float(plan.get("target_px") or 2500)
+        except Exception:
+            px = 2500.0
+        # composite (h × w × 3) + weight_sum (h × w), both float64.
+        return (px * px * 4 * 8) / (1024.0 * 1024.0)
+
+    def _start_tile_major_run(self, channels: list[str]):
+        """One worker, one raster, every channel captured at each tile."""
+        cam_idx = self._resolve_microscope_cam_idx()
+        try:
+            cam = self._camera_manager.cameras[cam_idx]
+        except (AttributeError, IndexError):
+            self._status.setText(f"Camera index {cam_idx} not available.")
+            return
+        try:
+            from SupportClasses.MosaicCalibration import (
+                build_mosaic_builder, refuse_reason)
+        except ImportError:
+            self._status.setText("MosaicCalibration unavailable.")
+            return
+        cal = self._mosaic_calibration(self._scan_frame_size)
+        reason = refuse_reason(cal) if cal is not None else "no calibration"
+        if reason:
+            self._status.setText(reason)
+            return
+        scan = self._scan_settings() or {}
+        target_px = int(getattr(self, "_full_res_canvas", None)
+                        or self._target_px.value())
+        plans: list[ChannelPlan] = []
+        for ch in channels:
+            builder = build_mosaic_builder(
+                cal, target_mosaic_px=target_px,
+                retain_for_reorient=True, retain_frames=False)
+            builder.generate_raster_positions(
+                self._scan_bounds, overlap=cal.overlap_frac)
+            rec = self.channel_recipe(ch) or {}
+            lo, hi = rec.get("display_lo"), rec.get("display_hi")
+            plans.append(ChannelPlan(
+                channel=ch, builder=builder,
+                exposure_us=float(rec.get("exposure_us") or 0.0),
+                gain_pct=rec.get("gain_pct"),
+                # 0 / unset falls back to the shared scan setting.
+                avg_frames=int(rec.get("avg_frames")
+                               or scan.get("avg_frames") or 1),
+                # Explicit operator levels BEAT the probe's measurement: they
+                # chose them against the histogram, so the mosaic should look
+                # like the preview did. Unset → the probe measures them.
+                levels=((float(lo), float(hi))
+                        if (lo is not None and hi is not None and hi > lo)
+                        else None)))
+
+        af = tracker = predictor = optics = scope = None
+        probe_sigma = None
+        if self._af_wanted():
+            (scope, af, tracker, predictor, optics, probe_sigma,
+             note) = self._build_autofocus(cal, cam)
+            if note:
+                logger.info("Fluor mosaic autofocus: %s", note)
+        timing = resolve_grab_timing(scan)
+        self._worker = _SingleWellMosaicWorker(
+            self._controller, cam, plans[0].builder, self._scan_positions,
+            self._safe_z,
+            fresh_frames=timing.fresh_frames,
+            fresh_timeout_s=timing.fresh_timeout_s,
+            settle_ms=timing.settle_ms,
+            registration_method=cal.reg_method,
+            probe_xy=self._well_center_um(self._scan_well),
+            scope=scope, autofocus=af, tracker=tracker,
+            focus_predictor=predictor, optics=optics,
+            probe_sigma_um=probe_sigma,
+            channels=plans)
+        self._worker.progress.connect(self._on_channel_progress)
+        self._worker.tile.connect(self._on_channel_tile)
+        self._worker.channel_done.connect(self._on_tile_major_channel)
+        self._worker.finished_all.connect(self._on_tile_major_finished)
+        self._worker.failed.connect(self._on_channel_failed)
+        self._update_button_state()
+        self._status.setText(
+            f"Capturing {len(plans)} channel(s), every colour per tile…")
+        self._worker.start()
+
+    def _on_tile_major_channel(self, channel, composite, extent, scale,
+                               frames, shift_um, meta):
+        """Persist ONE finished channel (the worker is still running)."""
+        self._save_channel_result(channel, composite, extent, scale, frames,
+                                  shift_um, meta)
+        self._refresh_channel_status()
+        self._refresh_preview()
+        self._notify_mosaic_ready()
+
+    def _on_tile_major_finished(self):
+        retire_worker(self._worker)
+        self._worker = None
+        self._finish_run()
 
     def _prompt_next_channel(self):
         if self._aborting:
@@ -2609,17 +3813,30 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._finish_run()
             return
         channel = self._capture_queue[self._capture_index]
-        num = fms.channel_number(channel)
-        ch_label = (f"{channel} channel ({num})" if num is not None
-                    else f"{channel} channel")
+        # v7.19 — try to SWITCH the cube rather than ask. Only when that
+        # refuses does the operator get the prompt, with the reason.
+        switched, why_not = self._ensure_cube_for(channel)
+        spin = getattr(self, "_channel_exposure", {}).get(channel)
+        if switched:
+            self._apply_channel_exposure(
+                float(spin.value()) if spin is not None else 0.0)
+            self._start_channel_scan(channel)
+            return
+
+        # ⚠ The label names the CASSETTE SLOT, resolved through
+        # `channel_slot`, never `channel_number`. That function returns an
+        # acquisition ORDINAL which the store's own comments say is not a
+        # turret position: on this rig it calls slot 3 "mCherry" when the
+        # cassette holds TxRed, and "Bright Field (5)" when slot 5 is empty.
+        ch_label = self._channel_prompt_label(channel)
         # v7.13 — the prompt carries the channel's remembered exposure and
         # applies it LIVE while open, so the operator focuses/checks at the
         # exposure the scan will actually use.
-        spin = getattr(self, "_channel_exposure", {}).get(channel)
+        detail = f"{why_not}\n\n" if why_not else ""
         dlg = _ChannelPromptDialog(
             channel,
-            f"Set the microscope filter / illumination for the {ch_label}, "
-            f"focus if needed, then click Start scan.\n\n"
+            f"{detail}Set the microscope filter / illumination for the "
+            f"{ch_label}, focus if needed, then click Start scan.\n\n"
             f"(Cancel stops the capture.)",
             exposure_ms=(float(spin.value()) if spin is not None else 0.0),
             on_apply_exposure=self._apply_channel_exposure,
@@ -2636,6 +3853,68 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             spin.setValue(ms)      # write-back → popout persistence
         self._apply_channel_exposure(ms)
         self._start_channel_scan(channel)
+
+    def _channel_prompt_label(self, channel: str) -> str:
+        """``"FITC channel (cassette slot 2)"`` — the SLOT, or no number.
+
+        Silence is correct when the cube cannot be resolved: a number that
+        names the wrong cube is worse than no number, because a TxRed image
+        filed as mCherry is a result nothing downstream can detect.
+        """
+        slots, _refusals = self._cube_slots(self._scope_state())
+        slot = slots.get(channel)
+        if slot:
+            return f"{channel} channel (cassette slot {slot})"
+        return f"{channel} channel"
+
+    def _ensure_cube_for(self, channel: str) -> tuple[bool, str]:
+        """Drive the cassette to ``channel``'s cube. ``(switched, why_not)``.
+
+        BLOCKING on purpose — this runs from the GUI thread between channels,
+        where the alternative was a modal dialog waiting on a human, so a
+        couple of seconds of turret rotation is strictly faster than what it
+        replaces. The per-tile path in tile-major mode uses the service
+        directly from the worker thread instead.
+        """
+        try:
+            from gui.widgets.optics_ensure import build_service, describe_refusal
+        except Exception:
+            return False, ""
+        service = build_service("fluor_mosaic_cube")
+        if service is None:
+            return False, ""
+        try:
+            res = service.ensure_filter(str(channel))
+        except Exception as exc:
+            logger.debug("ensure_filter(%s) failed: %s", channel, exc)
+            return False, ""
+        if getattr(res, "ok", False) and not getattr(res, "simulated", False):
+            logger.info("Filter cube for %s: %s", channel, res.describe())
+            return True, ""
+        # A SIMULATED switch is not a real one: the operator still has to move
+        # a real cube, so they still get the prompt.
+        return False, describe_refusal(res) if not getattr(res, "ok", False) \
+            else "the microscope is simulated, so the cube did not really move"
+
+    def _cube_record(self, channel: str) -> dict:
+        """``{cube_slot, cube_label}`` for the cube ACTUALLY in the path.
+
+        Read back from the body rather than assumed from the request, and
+        omitted entirely when it cannot be read — an absent field is
+        recoverable, a wrong one is not.
+        """
+        state = self._scope_state()
+        pos = getattr(state, "filter_position", None)
+        if not pos or not getattr(state, "connected", False):
+            return {}
+        label = ""
+        try:
+            from SupportClasses.OpticsRegistry import FILTER, optic_at
+            optic = optic_at(state, pos, FILTER)
+            label = str(getattr(optic, "label", "") or "")
+        except Exception:
+            label = ""
+        return {"cube_slot": int(pos), "cube_label": label}
 
     def _apply_channel_exposure(self, ms: float):
         """Apply a per-channel exposure to the microscope camera (0 = skip)."""
@@ -3007,28 +4286,46 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._run_af_summary = meta.get("af")
         if meta.get("af_note"):
             logger.info(f"Fluor mosaic AF: {meta['af_note']}")
-        if composite is not None and extent is not None:
-            plate_key = self._plate_key() or "plate"
-            color = self._channel_colors[channel]
-            try:
-                fms.get_store().save_channel(
-                    plate_key, self._scan_well, channel, composite, extent,
-                    color_rgb=(color.red(), color.green(), color.blue()),
-                    objective=self._scan_objective,
-                    um_per_px=self._scan_um_per_px, mosaic_scale=scale,
-                    frames=frames, shift_um=shift_um,
-                    exposure_us=float(meta.get("exposure_us")
-                                      or self._scan_exposure_us or 0.0),
-                    display_levels=meta.get("display_levels"),
-                    avg_frames=int(meta.get("avg_frames", 1) or 1))
-            except Exception as exc:
-                logger.warning("Fluor mosaic save failed: %s", exc)
-            self._maybe_attach_processed(plate_key, channel, composite, scale)
+        self._save_channel_result(channel, composite, extent, scale, frames,
+                                  shift_um, meta)
         self._capture_index += 1
         self._refresh_channel_status()
         self._refresh_preview()
         self._notify_mosaic_ready()
         self._prompt_next_channel()
+
+    def _save_channel_result(self, channel, composite, extent, scale, frames,
+                             shift_um, meta):
+        """Persist ONE finished channel. Shared by both acquisition orders.
+
+        v7.19 — factored out so channel-major and tile-major cannot record a
+        capture differently; the metadata a mosaic carries must not depend on
+        which order it happened to be captured in.
+        """
+        if composite is None or extent is None:
+            return
+        meta = meta or {}
+        plate_key = self._plate_key() or "plate"
+        color = self._channel_colors[channel]
+        try:
+            fms.get_store().save_channel(
+                plate_key, self._scan_well, channel, composite, extent,
+                color_rgb=(color.red(), color.green(), color.blue()),
+                objective=self._scan_objective,
+                um_per_px=self._scan_um_per_px, mosaic_scale=scale,
+                frames=frames, shift_um=shift_um,
+                exposure_us=float(meta.get("exposure_us")
+                                  or self._scan_exposure_us or 0.0),
+                display_levels=meta.get("display_levels"),
+                avg_frames=int(meta.get("avg_frames", 1) or 1),
+                gain_pct=(self.channel_recipe(channel) or {}).get("gain_pct"),
+                # v7.19 — read back from the body, so a saved channel says
+                # which cube was ACTUALLY in the path rather than which one
+                # was asked for.
+                **self._cube_record(channel))
+        except Exception as exc:
+            logger.warning("Fluor mosaic save failed: %s", exc)
+        self._maybe_attach_processed(plate_key, channel, composite, scale)
 
     def _maybe_attach_processed(self, plate_key, channel, composite, scale):
         """v7.13 — bake the optional denoise / background subtraction into a

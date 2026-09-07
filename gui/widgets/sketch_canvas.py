@@ -66,6 +66,10 @@ class SketchCanvas(QWidget):
     tool_changed = Signal(object)     # Tool
     fill_result = Signal(bool)        # paint-bucket success / not-enclosed
     constraints_changed = Signal()    # constraint added / removed / re-valued
+    # v7.21.4: a freshly drawn line was JOINED to an existing object's print
+    # start/stop (and re-ordered so the two print as one continuous bead).
+    # Carries an operator-facing description for the page's status line.
+    join_result = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -131,7 +135,11 @@ class SketchCanvas(QWidget):
 
         # ── Parametric constraints (v7.5.x) ──
         self._auto_constrain = True        # snap → capture coincident/point_on
-        self._snap_hit = None              # ("vertex"|"edge", shape_idx, anchor)
+        # ("vertex"|"edge"|"printstart"|"printend", shape_idx, anchor|None).
+        # The print* kinds are a shape's TOOLPATH start / stop (v7.21.4); their
+        # anchor is the equivalent solver anchor when that point happens to be
+        # one (a line endpoint, a rect corner), else None.
+        self._snap_hit = None
         self._draw_start_hit = None        # snap hit at draw-press time
         self._poly_hits: list = []         # per-vertex snap hits (polygon tool)
         self._last_report = None           # last SolveReport (page DOF label)
@@ -730,6 +738,16 @@ class SketchCanvas(QWidget):
         hit_kind, j, hit_anchor = hit
         if j == new_idx or not (0 <= j < len(self._sketch.shapes)):
             return False
+        if hit_kind in ("printstart", "printend"):
+            # v7.21.4 — a PRINT start/stop snap. When that point is also a real
+            # solver anchor (a line endpoint, a rect corner) capture the join as
+            # an ordinary coincident constraint so it survives later edits.
+            # When it is derived (a circle seam, a trimmed end) there is no
+            # anchor to reference, so capture nothing rather than write a ref
+            # the solver cannot resolve — the geometric snap still welds.
+            if hit_anchor is None:
+                return False
+            hit_kind = "vertex"
         target = self._sketch.shapes[j]
         if hit_kind == "edge" and target.kind not in ("line", "circle"):
             return False
@@ -816,7 +834,17 @@ class SketchCanvas(QWidget):
             best = None
             best_d = tol
             best_hit = None
-            # Vertices/centers first (tight), then edges.
+            # v7.21.4 — PRINT start/stop points FIRST, so a line can be
+            # joined to where an existing object begins or ends printing.
+            # They win ties against a coincident geometric vertex (the loops
+            # below only replace on a strictly smaller distance), because
+            # landing on the print point is what makes the two paths weld.
+            for vx, vy, i, kind, anchor in self._print_point_targets(exclude):
+                d = math.hypot(vx - p.x(), vy - p.y())
+                if d < best_d:
+                    best_d, best = d, QPointF(vx, vy)
+                    best_hit = (kind, i, anchor)
+            # Vertices/centers next (tight), then edges.
             for vx, vy, i, anchor in self._snap_vertices(exclude):
                 d = math.hypot(vx - p.x(), vy - p.y())
                 if d < best_d:
@@ -837,28 +865,87 @@ class SketchCanvas(QWidget):
                            round(p.y() / self._snap_mm) * self._snap_mm)
         return p
 
-    def _snap_vertices(self, exclude: int):
-        """Exact snap points with provenance: ``(x, y, shape_idx, anchor)`` —
-        corners, endpoints, polygon vertices, centers. The anchor string uses
-        the constraint vocabulary ("center", "p{k}", "c0".."c3")."""
+    def _print_point_targets(self, exclude: int = -1):
+        """Snap targets at every existing shape's PRINT START / PRINT STOP —
+        ``(x, y, shape_idx, "printstart"|"printend", anchor|None)``.
+
+        v7.21.4 (operator: *"we want to be able to join a line to the start or
+        stop position of any existing print object"*). These are the SAME
+        points the green >- / red [] markers are drawn at — where the compiler
+        really begins and ends that shape's bead, after a custom start point, a
+        rolled seam or a closure overlap — not merely a geometric vertex.
+        Landing exactly on one is what makes the compiler weld the two paths
+        into a single continuous bead (its weld tolerance is half a bead, so an
+        exact snap always welds), and ``_join_to_print_point`` then re-orders
+        the new line so that weld actually happens.
+
+        ``anchor`` is the equivalent constraint anchor when the print point
+        coincides with a real solver DOF (a line/polygon endpoint, a rect
+        corner, a centre) — so the join can be captured as a coincident
+        constraint and survive later edits — and None when the point is derived
+        (a circle seam, a trimmed sub-segment end): inventing an anchor the
+        solver cannot resolve would be worse than capturing no constraint.
+
+        Filled shapes and regions are excluded — their toolpath is a raster
+        with no operator-visible start/stop marker to aim at.
+        """
         out = []
         for i, sh in enumerate(self._sketch.shapes):
-            if i == exclude or sh.kind == "region":
+            if i == exclude or sh.kind in ("region", "travel"):
                 continue
-            if sh.kind == "travel":
-                out.append((sh.cx, sh.cy, i, "center"))
+            if getattr(sh, "filled", False):
                 continue
-            if sh.kind in ("circle", "ellipse", "rect"):
-                out.append((sh.cx, sh.cy, i, "center"))
-            if sh.kind == "rect":
-                hw, hh = sh.width / 2, sh.height / 2
-                out += [(sh.cx - hw, sh.cy - hh, i, "c0"),
-                        (sh.cx + hw, sh.cy - hh, i, "c1"),
-                        (sh.cx + hw, sh.cy + hh, i, "c2"),
-                        (sh.cx - hw, sh.cy + hh, i, "c3")]
-            elif sh.kind in ("line", "polygon"):
-                out += [(px, py, i, f"p{k}")
-                        for k, (px, py) in enumerate(sh.points)]
+            try:
+                sw = self._effective_start_world(sh)
+                out.append((sw.x(), sw.y(), i, "printstart",
+                            self._anchor_at_point(sh, sw.x(), sw.y())))
+                if self._shape_supports_end(sh):
+                    ew = self._effective_end_world(sh)
+                    out.append((ew.x(), ew.y(), i, "printend",
+                                self._anchor_at_point(sh, ew.x(), ew.y())))
+            except Exception:
+                continue                    # a snap query must never raise
+        return out
+
+    @classmethod
+    def _anchor_at_point(cls, sh: SketchShape, x: float, y: float):
+        """The constraint anchor of ``sh`` sitting exactly at (x, y), else None."""
+        for ax, ay, anchor in cls._shape_anchor_points(sh):
+            if abs(ax - x) <= 1e-6 and abs(ay - y) <= 1e-6:
+                return anchor
+        return None
+
+    @staticmethod
+    def _shape_anchor_points(sh: SketchShape) -> list:
+        """``(x, y, anchor)`` for every constraint anchor of ONE shape — the
+        single definition of a shape's exact snap points, shared by
+        :meth:`_snap_vertices` and :meth:`_anchor_at_point`. The anchor string
+        uses the constraint vocabulary ("center", "p{k}", "c0".."c3")."""
+        if sh.kind == "region":
+            return []
+        if sh.kind == "travel":
+            return [(sh.cx, sh.cy, "center")]
+        out = []
+        if sh.kind in ("circle", "ellipse", "rect"):
+            out.append((sh.cx, sh.cy, "center"))
+        if sh.kind == "rect":
+            hw, hh = sh.width / 2, sh.height / 2
+            out += [(sh.cx - hw, sh.cy - hh, "c0"),
+                    (sh.cx + hw, sh.cy - hh, "c1"),
+                    (sh.cx + hw, sh.cy + hh, "c2"),
+                    (sh.cx - hw, sh.cy + hh, "c3")]
+        elif sh.kind in ("line", "polygon"):
+            out += [(px, py, f"p{k}") for k, (px, py) in enumerate(sh.points)]
+        return out
+
+    def _snap_vertices(self, exclude: int):
+        """Exact snap points with provenance: ``(x, y, shape_idx, anchor)`` —
+        corners, endpoints, polygon vertices, centers."""
+        out = []
+        for i, sh in enumerate(self._sketch.shapes):
+            if i == exclude:
+                continue
+            out += [(x, y, i, a) for (x, y, a) in self._shape_anchor_points(sh)]
         return out
 
     def _snap_edges(self, p: QPointF, exclude: int):
@@ -2200,15 +2287,107 @@ class SketchCanvas(QWidget):
                     new_idx, a_corner, self._draw_start_hit)
                 captured |= self._maybe_add_snap_constraint(
                     new_idx, b_corner, end_hit)
-            self._draw_start_hit = None
+            press_hit, self._draw_start_hit = self._draw_start_hit, None
+            # v7.21.4 — the line was drawn onto an existing object's print
+            # start/stop: move it next to that object so the two actually
+            # print as ONE bead (coinciding points alone do not weld unless
+            # they are adjacent in print order).
+            final_idx = len(self._sketch.shapes) - 1
+            if self._tool == Tool.LINE:
+                final_idx = self._join_to_print_point(
+                    final_idx, press_hit, end_hit)
             # Select the new shape via the canonical setter so BOTH _selection
             # (highlight + handles) and _selected (props panel) stay in sync.
-            self._set_selection({len(self._sketch.shapes) - 1})
+            self._set_selection({final_idx})
             if captured:
                 self.solve_constraints()
                 self.constraints_changed.emit()
             self.sketch_changed.emit()
         self.update()
+
+    # ── Join to an existing object's print start / stop (v7.21.4) ──
+
+    #: Preference when BOTH endpoints of the new line landed on a print point.
+    #: ``(hit kind, which endpoint)`` → rank; lower wins. The first two need no
+    #: reversal (the compiler's own pass-0 flip handles them), so they are
+    #: preferred over the cases that have to pin a start point.
+    _JOIN_RANK = {("printend", "p0"): 0, ("printstart", "p1"): 1,
+                  ("printend", "p1"): 2, ("printstart", "p0"): 3}
+
+    def _join_to_print_point(self, new_idx: int, press_hit, release_hit) -> int:
+        """Re-order a just-drawn line so it prints CONTINUOUSLY with the object
+        whose print start/stop it was snapped to. Returns its final index.
+
+        Coincident points are necessary but not sufficient: the compiler welds
+        two paths only when they are ADJACENT in the shape list, so a line
+        drawn onto shape *j*'s exit has to sit right after *j* (and one drawn
+        onto *j*'s entry right before it). Four cases, by which endpoint landed
+        where:
+
+        * press (p0) on *j*'s STOP   → insert AFTER *j*; our path already
+          starts there.
+        * release (p1) on *j*'s STOP → insert AFTER *j*; the compiler's own
+          pass-0 flip leads with the nearer endpoint, so it starts there too.
+        * release (p1) on *j*'s START → insert BEFORE *j*; our default exit is
+          p1, which is exactly where *j* begins.
+        * press (p0) on *j*'s START  → insert BEFORE *j* AND pin the line's
+          print start to its other endpoint, so it runs p1→p0 and ENDS where
+          *j* begins. This is the one case the compiler cannot fix itself (its
+          flip looks backwards, at the previous shape's exit).
+
+        A snap onto anything else (a plain vertex, an edge, the grid) re-orders
+        nothing — only a deliberate landing on a print marker does.
+        """
+        shapes = self._sketch.shapes
+        if not (0 <= new_idx < len(shapes)):
+            return new_idx
+        cands = []
+        for hit, which in ((press_hit, "p0"), (release_hit, "p1")):
+            if not hit:
+                continue
+            kind, j = hit[0], int(hit[1])
+            if kind in ("printstart", "printend") and j != new_idx                     and 0 <= j < len(shapes):
+                cands.append((self._JOIN_RANK[(kind, which)], kind, j, which))
+        if not cands:
+            return new_idx
+        _rank, kind, j, which = min(cands)
+        sh = shapes.pop(new_idx)            # new_idx is the last index …
+        dest = j + 1 if kind == "printend" else j   # … so j never shifts
+        shapes.insert(dest, sh)
+        if kind == "printstart" and which == "p0" and len(sh.points) >= 2:
+            sh.start_point = (float(sh.points[1][0]), float(sh.points[1][1]))
+        # After the insert the joined-to shape sits just before us when we
+        # went AFTER it, and just after us when we went BEFORE it.
+        target = shapes[dest - 1] if kind == "printend" else shapes[dest + 1]
+        where = "stop" if kind == "printend" else "start"
+        self.join_result.emit(
+            f"Joined to the {where} of {target.kind} — they print as one bead")
+        return dest
+
+    # ── No-extrude (move-only) sections (v7.21.4) ─────────────────
+
+    def set_no_print(self, indices, value: bool) -> int:
+        """Mark shapes as move-only (``no_print``) or printing again.
+
+        The needle still follows their path — at print height, welded to its
+        neighbours — but deposits nothing, so a whole print section can be
+        turned into a pure repositioning move without deleting or re-drawing
+        it. Undoable; returns how many shapes actually changed.
+        """
+        shapes = self._sketch.shapes
+        want = bool(value)
+        idxs = [int(i) for i in indices
+                if 0 <= int(i) < len(shapes)
+                and shapes[int(i)].kind != "travel"
+                and bool(getattr(shapes[int(i)], "no_print", False)) != want]
+        if not idxs:
+            return 0
+        self._snapshot()
+        for i in idxs:
+            shapes[i].no_print = want
+        self.sketch_changed.emit()
+        self.update()
+        return len(idxs)
 
     def _do_fill(self, world: QPointF):
         pts = compute_fill_region(

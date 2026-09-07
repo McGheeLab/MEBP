@@ -696,7 +696,12 @@ class StageHardwarePanel(QWidget):
             sp_w.setMinimumWidth(s(140))
             return sp_w
 
-        self.spin_max_xy_speed = _cap_spin(10000.0, "µm/s")
+        # v7.21.1: spin_max_xy_speed is now a REAL, visible control owned by the
+        # XY Stage Calibration group (built earlier). Only create a headless
+        # shadow if that group somehow didn't run, so _load_from_settings /
+        # _apply_safety_and_zero can never hit an AttributeError.
+        if not hasattr(self, "spin_max_xy_speed"):
+            self.spin_max_xy_speed = _cap_spin(10000.0, "µm/s")
         self.spin_max_z_feed = _cap_spin(500.0, "mm/min")
         self.spin_max_pump_feed = _cap_spin(200.0, "mm/min")
 
@@ -1167,6 +1172,14 @@ class StageHardwarePanel(QWidget):
                     "ok", "Simulated" if simulate else "Connected")
             else:
                 self.badge_xy.set_status("err", "Failed")
+            # v7.18.1: cache the winning protocol + port + baud so the next
+            # connect skips the full sweep. Real HW only.
+            if ok and not simulate and self._settings is not None:
+                hint = self._controller.xy_connection_hint
+                if hint:
+                    self._settings.set("xy_stage.last_good", hint)
+                    self._settings.save()
+                    logger.info("XY last_good cached: %s", hint)
         except Exception as e:
             self.badge_xy.set_status("err", f"Error: {e}")
 
@@ -1374,6 +1387,84 @@ class StageHardwarePanel(QWidget):
     # indicates a mechanical issue (belt slip, encoder mis-cal),
     # not a software setting.
 
+    def _refresh_xy_max_speed_hint(self, *_args) -> None:
+        """Echo the µm/s max speed in mm/s — the unit operators quote stage
+        specs in — so a wrong order of magnitude is obvious while typing, and
+        state its PROVENANCE.
+
+        v7.21.2: the provenance line matters because the XY calibration now
+        overwrites this field automatically. Without it there is no way to tell a
+        measured value from a typed guess, which is precisely the ambiguity that
+        let two homes for this number drift apart in the first place.
+        """
+        lbl = getattr(self, "lbl_xy_max_speed_hint", None)
+        if lbl is None:
+            return
+        try:
+            mm_s = float(self.spin_max_xy_speed.value()) / 1000.0
+        except Exception:
+            return
+        src, when = "", ""
+        s = getattr(self, "_settings", None)
+        if s is not None:
+            try:
+                src = str(s.get("device_profile.xy_max_speed_source") or "")
+                when = str(s.get("device_profile.xy_max_speed_measured_at") or "")
+            except Exception:
+                src, when = "", ""
+        if src == "measured":
+            prov = f" Measured by XY Calibration{(' ' + when[:10]) if when else ''}."
+        else:
+            prov = (" Typed — not measured. Workflows → XY↔ZP Timing Calibration "
+                    "→ Run XY Calibration measures it.")
+        lbl.setText(
+            f"= {mm_s:.2f} mm/s at 100%. Drives the mm/s→SMS conversion, the "
+            f"jog/print speed-% anchor, and safe-travel speed. Applies on Save."
+            + prov)
+
+    def refresh_speed_limits(self) -> None:
+        """External hook — re-read the declared XY top speed after ANOTHER surface
+        changed it (the XY calibration writes it automatically).
+
+        v7.21.2: before this existed, ``MainWindow._refresh_all_speed_limits`` fanned
+        out to every panel EXCEPT this one, so a calibration updated the stage, the
+        store, both settings keys and every jog anchor while the field the operator
+        actually looks at kept showing the old number until a restart.
+
+        ``blockSignals`` around the write because ``valueChanged`` is wired to the
+        hint refresh; a future writer on that signal would otherwise loop back
+        through ``notify_speed_limits_changed``.
+        """
+        spin = getattr(self, "spin_max_xy_speed", None)
+        if spin is None:
+            return
+        v = None
+        ctrl = getattr(self, "_controller", None)
+        if ctrl is not None and hasattr(ctrl, "declared_xy_top_speed_um_s"):
+            try:
+                v = ctrl.declared_xy_top_speed_um_s()
+            except Exception:
+                v = None
+        if not v:
+            s = getattr(self, "_settings", None)
+            if s is not None:
+                try:
+                    v = s.get("device_profile.xy_max_speed_um_s")
+                except Exception:
+                    v = None
+        try:
+            v = float(v) if v else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        if v <= 0:
+            return
+        blocked = spin.blockSignals(True)
+        try:
+            spin.setValue(v)
+        finally:
+            spin.blockSignals(blocked)
+        self._refresh_xy_max_speed_hint()
+
     def _build_xy_cal_group(self) -> QGroupBox:
         grp = QGroupBox("XY Stage Calibration")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
@@ -1414,6 +1505,41 @@ class StageHardwarePanel(QWidget):
         self.lbl_xy_controller_hint.setStyleSheet(
             f"color: {COLORS['subtext0']}; ")
         outer.addWidget(self.lbl_xy_controller_hint)
+
+        # ── v7.21.1: Max speed — this machine's TRUE top speed ────────
+        # Created HERE (not in the Jog & Safety group, which is built later and
+        # only ever held it as a headless shadow) because this is the field that
+        # governs XY speed everywhere: the mm/s↔SMS-% denominator, the 100%
+        # anchor for jog/print %, and the safe-travel speed.
+        form_top = QFormLayout()
+        form_top.setHorizontalSpacing(s(10))
+        self.spin_max_xy_speed = QDoubleSpinBox()
+        self.spin_max_xy_speed.setRange(100.0, 1e6)
+        self.spin_max_xy_speed.setDecimals(0)
+        self.spin_max_xy_speed.setSingleStep(100.0)
+        self.spin_max_xy_speed.setSuffix(" µm/s")
+        self.spin_max_xy_speed.setValue(10000.0)
+        self.spin_max_xy_speed.setMinimumWidth(s(140))
+        self.spin_max_xy_speed.setToolTip(
+            "This stage's TRUE top speed at 100% — the speed it reaches when "
+            "commanded flat out.\n\n"
+            "It is the denominator for every mm/s command (Prior SMS% = "
+            "requested ÷ this), the 100% anchor for jog and print speed "
+            "percentages, and the speed used for safe travel between wells.\n\n"
+            "MEASURE IT, don't guess: Workflows → XY↔ZP Timing Calibration → "
+            "Measure top speed. Setting this BELOW the real top speed makes "
+            "every commanded speed run proportionally FASTER than asked.")
+        self.spin_max_xy_speed.valueChanged.connect(
+            self._refresh_xy_max_speed_hint)
+        form_top.addRow("Max speed (true top):", self.spin_max_xy_speed)
+        outer.addLayout(form_top)
+
+        self.lbl_xy_max_speed_hint = QLabel("")
+        self.lbl_xy_max_speed_hint.setWordWrap(True)
+        self.lbl_xy_max_speed_hint.setStyleSheet(
+            f"color: {COLORS['subtext0']}; ")
+        outer.addWidget(self.lbl_xy_max_speed_hint)
+        self._refresh_xy_max_speed_hint()
 
         # ── Velocity / acceleration / jerk ─────────────────────
         form = QFormLayout()
@@ -3185,7 +3311,19 @@ class StageHardwarePanel(QWidget):
             _ub = self._pump_raw_to_user(pid, _raw_hi)
             self.spin_p_mins[pid].setValue(min(_ua, _ub))
             self.spin_p_maxs[pid].setValue(max(_ua, _ub))
-        self.spin_max_xy_speed.setValue(float(s.get("safety_limits.max_xy_speed", 10000.0)))
+        # v7.21.1: prefer the explicit per-machine declaration; the
+        # safety_limits mirror is the legacy/fallback source. Both are written
+        # together on Save, so they agree except on a pre-v7.21.1 settings file.
+        _declared_xy_top = s.get("device_profile.xy_max_speed_um_s")
+        try:
+            _declared_xy_top = (float(_declared_xy_top)
+                                if _declared_xy_top else None)
+        except (TypeError, ValueError):
+            _declared_xy_top = None
+        self.spin_max_xy_speed.setValue(
+            _declared_xy_top if _declared_xy_top
+            else float(s.get("safety_limits.max_xy_speed", 10000.0)))
+        self._refresh_xy_max_speed_hint()
         self.spin_max_z_feed.setValue(float(s.get("safety_limits.max_z_feedrate", 500.0)))
         self.spin_max_pump_feed.setValue(float(s.get("safety_limits.max_pump_feedrate", 200.0)))
 
@@ -3599,6 +3737,12 @@ class StageHardwarePanel(QWidget):
             s.set(f"safety_limits.{pid.lower()}_min", _p_raw[pid][0])
             s.set(f"safety_limits.{pid.lower()}_max", _p_raw[pid][1])
         s.set("safety_limits.max_xy_speed", self.spin_max_xy_speed.value())
+        # v7.21.1: also record it as an EXPLICIT per-machine declaration. The
+        # safety_limits key carries a 10000 default, so it cannot express
+        # "never declared" — and only an explicit declaration may drive the
+        # mm/s↔SMS denominator (see StageController.declared_xy_top_speed_um_s).
+        s.set("device_profile.xy_max_speed_um_s",
+              self.spin_max_xy_speed.value())
         s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
         s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
         # Mirror into live controller.safety_limits if available
@@ -3621,7 +3765,14 @@ class StageHardwarePanel(QWidget):
                     # live clamp envelope stays in the raw Marlin frame.
                     setattr(sl, f"{pid_l}_min", _p_raw[pid][0])
                     setattr(sl, f"{pid_l}_max", _p_raw[pid][1])
-            sl.max_xy_speed = self.spin_max_xy_speed.value()
+            # v7.21.1: route through the controller's ONE setter so the live
+            # SMS denominator, the safety mirror and the jog anchors all move
+            # together. A plain `sl.max_xy_speed = …` would update the anchor
+            # while leaving the stage converting mm/s against a stale top speed.
+            if hasattr(ctrl, "set_xy_top_speed_um_s"):
+                ctrl.set_xy_top_speed_um_s(self.spin_max_xy_speed.value())
+            else:
+                sl.max_xy_speed = self.spin_max_xy_speed.value()
             sl.max_z_feedrate = self.spin_max_z_feed.value()
             sl.max_pump_feedrate = self.spin_max_pump_feed.value()
             # Persist current zero_position snapshot too
@@ -3757,6 +3908,10 @@ class StageHardwarePanel(QWidget):
             s.set(f"safety_limits.{pid.lower()}_min", min(_ra, _rb))
             s.set(f"safety_limits.{pid.lower()}_max", max(_ra, _rb))
         s.set("safety_limits.max_xy_speed", self.spin_max_xy_speed.value())
+        # v7.21.1: the explicit declaration travels with the profile too, so
+        # loading a machine's profile restores its true top speed.
+        s.set("device_profile.xy_max_speed_um_s",
+              self.spin_max_xy_speed.value())
         s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
         s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
 

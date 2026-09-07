@@ -1267,6 +1267,39 @@ class TUCamBackend:
     def set_auto_exposure(self, enabled: bool) -> bool:
         return self._capa_set(TUIDC_ATEXPOSURE, 1 if enabled else 0)
 
+    def get_auto_levels(self):
+        """Hardware auto black/white levels, or None when unsupported.
+
+        v7.19. ``TUIDC_ATLEVELS`` had been a constant and a diagnostics label
+        since v7.9 with no getter or setter anywhere, so there was no way to
+        turn it off.
+
+        ⚠ This is NOT the software display auto-scale
+        (``set_display_auto_scale`` / ``put_display_black`` / ``put_display_white``,
+        which map mono16 to 8-bit for the DISPLAY and change no captured pixel).
+        This moves the sensor's own black/white points, so it changes the RAW
+        data a fluorescence mosaic captures — which is why a quantitative scan
+        has to switch it off.
+
+        Its declared range is 0..3 rather than 0..1, so it is not a plain
+        boolean; anything non-zero reads as "on" and the off value is 0. That
+        0..3 range is also the tell that identified it: v7.9 had this id wired
+        as auto-EXPOSURE, and a boolean capability would have declared 0..1.
+        """
+        v = self._capa_get(TUIDC_ATLEVELS)
+        return None if v is None else bool(v)
+
+    def set_auto_levels(self, enabled: bool) -> bool:
+        """Enable/disable hardware auto levels.
+
+        Goes through ``_capa_set``, whose equal-value guard is load-bearing here
+        for exactly the reason recorded on that method: a redundant capability
+        write collapses this camera's exposure to the sensor minimum. The
+        fluorescence workflow applies its preset on EVERY page entry, so the
+        no-change case is the common one, not the rare one.
+        """
+        return self._capa_set(TUIDC_ATLEVELS, 1 if enabled else 0)
+
     # ── Raw statistics + averaged capture (v7.13, shared contract) ──
     def _service_raw_plane(self, plane, depth: int):
         """Per-frame raw-plane servicing, on the reader thread: statistics
@@ -1434,6 +1467,9 @@ class TUCamBackend:
             "exposure_us": self.get_exposure_time(),
             "exposure_gain_pct": self.get_exposure_gain(),
             "auto_exposure": self.get_auto_exposure(),
+            # v7.19 — the SENSOR's own auto black/white points, distinct from
+            # the `*_auto_scale` display mapping further down.
+            "auto_levels": self.get_auto_levels(),
             "exposure_range_us": self.get_exposure_time_range(),
             "gain_range_pct": self.get_exposure_gain_range(),
             "resolution": self.get_resolution(),

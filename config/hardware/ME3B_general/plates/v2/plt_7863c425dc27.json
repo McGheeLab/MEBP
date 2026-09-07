@@ -5,15 +5,15 @@
     "id": "plt_7863c425dc27",
     "name": "Custom 6 insert with rosette",
     "kind": "plate",
-    "rev": 7,
+    "rev": 8,
     "description": "24-well plate",
     "created": "2026-08-06T22:56:43+00:00",
-    "modified": "2026-08-07T01:23:18+00:00",
+    "modified": "2026-09-03T00:12:04+00:00",
     "z_offsets": {
-      "bottom": 12.43,
+      "bottom": 12.57,
       "max": -7.0,
       "safe": -4.0,
-      "top": 2.8
+      "top": 2.6
     }
   },
   "units": "mm",

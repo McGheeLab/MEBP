@@ -870,6 +870,14 @@ class MainWindow(QMainWindow):
                     "device_profile.per_axis_max_feedrate") or None,
                 persist_steps=False,    # Don't re-send M92 on startup
                 persist_feedrate=False,  # _setup_printer handles initial M203
+                # v7.21.1: restore this machine's DECLARED true XY top speed so
+                # the mm/s↔SMS denominator, the jog/print speed-% anchor and
+                # safe-travel speed are all correct from the first move —
+                # including moves commanded before the operator ever opens
+                # Hardware Setup. None (never declared) leaves the stage on its
+                # protocol max_speed, exactly as before.
+                xy_max_speed_um_s=self.settings.get(
+                    "device_profile.xy_max_speed_um_s") or None,
             )
         except Exception as e:
             logger.warning(f"v7.4.2 apply_device_settings failed: {e}")
@@ -2310,10 +2318,21 @@ class MainWindow(QMainWindow):
         host.set_native_available(native is not None)
         # Label the native pill for the current page ("Jog" for jog-capable
         # pages; the page's own controls elsewhere).
+        #
+        # v7.19: ask the page first. The map below is keyed on the page CLASS,
+        # and every workflow shares one class (WorkflowsModePage), so a workflow
+        # whose panel is not a jog panel — Fluorescence Mosaic's signal
+        # controls — could not be labelled correctly from here.
         cls = type(page).__name__ if page is not None else ""
+        label = None
+        if page is not None and hasattr(page, "context_label"):
+            try:
+                label = page.context_label()
+            except Exception as e:
+                logger.debug("context_label failed for page %s: %s", cls, e)
         host.set_native_label(
-            {"HardwareSetupPage": "Controls",
-             "SettingsPage": "Safety"}.get(cls, "Jog"))
+            label or {"HardwareSetupPage": "Controls",
+                      "SettingsPage": "Safety"}.get(cls, "Jog"))
         self._context_title.setText(self._context_title_for(page, idx))
 
         # Scope = "everywhere the left box already appears": a page qualifies iff
@@ -2851,8 +2870,12 @@ class MainWindow(QMainWindow):
                     pass
         for page in (getattr(self, "_page_widgets", None) or []):
             _refresh(page)
+            # v7.21.2: "_stage_panel" added — it owns the Hardware Setup
+            # "Max speed" field, so before this the XY calibration wrote the
+            # measured value everywhere EXCEPT the field that displays it,
+            # and the operator saw a stale number until an app restart.
             for attr in ("_control_panel", "_context_widget",
-                         "_context_panel", "_hw_panel"):
+                         "_context_panel", "_hw_panel", "_stage_panel"):
                 _refresh(getattr(page, attr, None))
 
     def _update_status(self):

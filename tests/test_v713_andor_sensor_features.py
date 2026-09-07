@@ -399,15 +399,32 @@ class TestCapsAndDelegates(unittest.TestCase):
 class TestHwControlsSnapshot(unittest.TestCase):
     def test_key_list_complete(self):
         # The full persisted set — including the three andor display-scale
-        # keys the bulk save used to drop, and the five v7.13 sensor keys.
+        # keys the bulk save used to drop, the five v7.13 sensor keys, and
+        # v7.19's auto_levels (the camera's OWN black/white points, which the
+        # fluorescence preset has to be able to turn off and restore).
         expected = {
-            "auto_exposure", "exposure_us", "exposure_gain_pct",
+            "auto_exposure", "auto_levels", "exposure_us", "exposure_gain_pct",
             "gamma", "brightness", "contrast",
             "andor_auto_scale", "andor_scale_lo", "andor_scale_hi",
             "andor_sensor_cooling", "andor_readout_rate", "andor_gain_mode",
             "andor_noise_filter", "andor_blemish_correction",
         }
         self.assertEqual(set(PERSISTED_HW_CONTROL_KEYS), expected)
+
+    def test_auto_levels_is_not_the_display_scale_channel(self):
+        """v7.19 — the two must stay distinguishable in the persisted set.
+
+        ``auto_levels`` moves the SENSOR's black/white points (it changes raw
+        pixel values); ``andor_auto_scale`` is the software mono16→8-bit
+        DISPLAY mapping. Collapsing them would make a mosaic's raw data depend
+        on a display preference.
+        """
+        self.assertIn("auto_levels", PERSISTED_HW_CONTROL_KEYS)
+        self.assertIn("andor_auto_scale", PERSISTED_HW_CONTROL_KEYS)
+        snap = hw_controls_snapshot(
+            {"auto_levels": False, "andor_auto_scale": True})
+        self.assertIs(snap["auto_levels"], False)
+        self.assertIs(snap["andor_auto_scale"], True)
 
     def test_snapshot_from_readback(self):
         st = {"exposure_us": 5000, "andor_gain_mode": "16-bit (x)",

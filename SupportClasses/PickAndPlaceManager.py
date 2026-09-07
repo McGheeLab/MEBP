@@ -960,6 +960,20 @@ class PickPlaceExecutor:
         self.buffer_needles: float = 1.0     # aspirated from the buffer well
         self.prep_rate_uL_s: float = 1.0     # aspirate/dispense flow during prep
         self.service_z_mm: Optional[float] = None  # dip Z at service wells (zero-ref)
+        # ── v7.21.7: HOLD IN LIQUID AFTER ASPIRATING ─────────────────
+        # Seconds to hold the needle STILL SUBMERGED after a reagent aspirate
+        # (ink / oil / buffer) has finished, BEFORE the retract-and-travel that
+        # follows. `_settled_pump_move` already blocks until the PLUNGER has
+        # drained from Marlin's planner, so the plunger is provably done — the
+        # FLUID is not: a compliant column (fine bore, viscous ink, long tube)
+        # keeps drawing in for a while after the plunger stops. Lift Z inside
+        # that window and the tip is in AIR, so the tail of the aspirate is air
+        # — a needle that then prints nothing while the run reports success.
+        # None (default) = INHERIT the global `pump_post_aspirate_dwell_s` from
+        # the controller (Hardware Setup → Pump / Common Print Settings), so
+        # every workflow picks the value up with no per-page wiring. A float
+        # here overrides it for this run; 0.0 disables the hold.
+        self.post_aspirate_dwell_s: Optional[float] = None
         # Wash = dip + jiggle Z up/down + random XY jiggle about the well centre.
         self.wash_cycles: int = 3
         self.wash_z_amplitude_mm: float = 0.5      # how far up/down each jiggle
@@ -2041,10 +2055,18 @@ class PickPlaceExecutor:
                 raise RuntimeError(
                     f"Prep: {label} well not configured/resolved ({key})")
 
-        def actuate(needles, sign, label, compensate=False):
-            """One prep actuation across every prepping bore."""
+        def actuate(needles, sign, label, compensate=False, liquid=None):
+            """One prep actuation across every prepping bore.
+
+            v7.21.7 ``liquid``: name of the fluid being ASPIRATED. When given,
+            hold the needle submerged for the post-aspirate dwell once the pump
+            has finished, BEFORE the caller travels on (which retracts Z out of
+            the liquid). Omitted on a DISPENSE, where leaving early costs
+            nothing.
+            """
             if needles <= 0:
                 return
+            moved = True
             if plan:
                 self._set_sub_step(prep_op, label)
                 self._prep_bore_plan_guard(plan)
@@ -2058,7 +2080,14 @@ class PickPlaceExecutor:
                     _settled_pump_move(self.controller, bore,
                                        sign * unit * needles, rate_uL_s=rate,
                                        compensate=compensate)
+            else:
+                moved = False   # nothing actuated → nothing to hold in liquid
+            # The abort check stays UNCONDITIONAL — it ran on the no-op branch
+            # before v7.21.7 too, and an early return here would quietly remove
+            # an abort opportunity from the prep sequence.
             self._check_abort()
+            if moved and liquid:
+                self._settle_in_liquid(prep_op, liquid)
 
         # 1. Waste — dispense oil.
         goto("__waste__", "waste")
@@ -2069,7 +2098,7 @@ class PickPlaceExecutor:
         goto("__oil__", "oil")
         actuate(self.oil_needles, -1.0,
                 f"Prep: aspirate {self.oil_needles:g} needle(s) of oil",
-                compensate=None)
+                compensate=None, liquid="oil")
 
         # 3. Wash.
         goto("__wash__", "wash")
@@ -2080,7 +2109,7 @@ class PickPlaceExecutor:
         goto("__buffer__", "buffer")
         actuate(self.buffer_needles, -1.0,
                 f"Prep: aspirate {self.buffer_needles:g} needle(s) of buffer",
-                compensate=None)
+                compensate=None, liquid="buffer")
 
         self._set_sub_step(prep_op, "Prep complete")
 
@@ -2132,9 +2161,12 @@ class PickPlaceExecutor:
                 raise RuntimeError(
                     f"Clean: {label} well not configured/resolved ({key})")
 
-        def actuate(needles, sign, label, compensate=False):
+        def actuate(needles, sign, label, compensate=False, liquid=None):
+            # v7.21.7 `liquid`: see run_prep.actuate — hold the needle in the
+            # fluid after an aspirate, before the travel that lifts it out.
             if needles <= 0:
                 return
+            moved = True
             if plan:
                 self._set_sub_step(clean_op, label)
                 self._prep_bore_plan_guard(plan)
@@ -2148,7 +2180,14 @@ class PickPlaceExecutor:
                     _settled_pump_move(self.controller, bore,
                                        sign * unit * needles, rate_uL_s=rate,
                                        compensate=compensate)
+            else:
+                moved = False   # nothing actuated → nothing to hold in liquid
+            # The abort check stays UNCONDITIONAL — it ran on the no-op branch
+            # before v7.21.7 too, and an early return here would quietly remove
+            # an abort opportunity from the prep sequence.
             self._check_abort()
+            if moved and liquid:
+                self._settle_in_liquid(clean_op, liquid)
 
         # 1. Waste — dispense residual.
         goto("__waste__", "waste")
@@ -2165,7 +2204,7 @@ class PickPlaceExecutor:
         goto("__buffer__", "buffer")
         actuate(self.buffer_needles, -1.0,
                 f"Clean: aspirate {self.buffer_needles:g} needle(s) of buffer",
-                compensate=None)
+                compensate=None, liquid="buffer")
 
         self._set_sub_step(clean_op, "Clean complete")
 
@@ -2204,6 +2243,11 @@ class PickPlaceExecutor:
                     "Oil prep: oil well not configured/resolved (__oil__)")
             self._pump_move(bore, -v, rate_uL_s=rate,
                                compensate=None)
+            # v7.21.7: this branch ASPIRATES oil, so hold the tip submerged
+            # before the next step travels (and retracts) away. The
+            # dispense-to-waste branch above needs no hold.
+            self._check_abort()
+            self._settle_in_liquid(op, "oil")
         self._check_abort()
 
     def run_print_cleanup(self):
@@ -2330,6 +2374,14 @@ class PickPlaceExecutor:
         if abs(oil_uL) > 1e-6:
             self._set_sub_step(clean_op, f"Cleanup: reset oil ({oil_uL:+.3f} µL)")
             self._pump_move(bore, oil_uL, rate_uL_s=rate)
+            # v7.21.7: the reset is signed — it can go EITHER way depending on
+            # where the plunger ended up, so the hold is gated on the direction
+            # rather than on the step. `-` = ASPIRATE (drawing oil in), the case
+            # that must stay submerged; `+` dispenses into the well and can
+            # leave immediately.
+            if oil_uL < 0:
+                self._check_abort()
+                self._settle_in_liquid(clean_op, "oil")
 
         self._set_sub_step(clean_op, "Cleanup complete")
 
@@ -2471,6 +2523,7 @@ class PickPlaceExecutor:
 
         stop = self._orbit_xy((cx, cy), orbit_diameter_mm, orbit_speed_mm_s) \
             if orbit else None
+        ink_op = SimpleNamespace(op_id="INK_PICKUP", sub_step="")
         try:
             aspirate_total = vol + prime  # >0 (guarded above)
             if aspirate_total > 0:
@@ -2481,6 +2534,16 @@ class PickPlaceExecutor:
                 # Dispense the extra back INTO the ink well (+ = dispense).
                 self._pump_move(bore, prime,
                                    rate_uL_s=p_rate, compensate=compensate)
+                self._check_abort()
+            # v7.21.7: HOLD IN THE INK before the caller retracts. Placed at the
+            # END of the in-well pump sequence, not straight after the aspirate,
+            # because the prime dispense-back happens with the tip still in the
+            # well and no Z move in between — so ONE hold immediately before the
+            # needle actually leaves is what the operator asked for, and it does
+            # not double the wait when priming is on. Inside the try, so the
+            # orbit keeps stirring granular ink through the hold and is stopped
+            # by the `finally` either way.
+            self._settle_in_liquid(ink_op, "ink")
         finally:
             if stop is not None:
                 self._stop_orbit(stop, (cx, cy))
@@ -2791,7 +2854,7 @@ class PickPlaceExecutor:
         same_well = bool(target.well_name) and target.well_name == self._current_well
         if not same_well:
             # Inter-well: full safe Z
-            self._safe_travel(
+            ok = self._safe_travel(
                 target_x_um=x_um,
                 target_y_um=y_um,
                 safe_z_mm=self.safe_z_mm,
@@ -2799,6 +2862,26 @@ class PickPlaceExecutor:
                 z_timeout_s=self.z_timeout_s,
                 xy_timeout_s=self.xy_timeout_s,
             )
+            # v7.20 CRITICAL SAFETY: ACT on the verdict. `safe_travel_to`
+            # returns False when the retract was not confirmed, when the XY
+            # arrival was not confirmed, or on abort — and this result used to
+            # be DISCARDED, so the caller went straight on to descend, aspirate
+            # or dispense at a position the stage may never have reached.
+            #
+            # Note the asymmetry this removes: `_intra_well_move` below already
+            # raises on an unconfirmed move, and it is the SHORTER, less
+            # dangerous one. The inter-well travel — needle crossing the whole
+            # plate — must not use a weaker policy than its intra-well sibling.
+            #
+            # Only an explicit False is a failure: a stub/older controller that
+            # returns None cannot report a verdict, and "absent" degrades to
+            # permitted exactly as `_wait_xy_arrival_um` already documents.
+            if ok is False:
+                raise AbortException(
+                    f"Travel to ({x_um:.0f}, {y_um:.0f}) µm was not confirmed "
+                    "— stopping with the needle retracted rather than "
+                    "descending or dispensing at an unverified position. "
+                    "Check the XY and Z/pump boards.")
         else:
             # Intra-well: small retract
             self._intra_well_move(x_um, y_um, target_z_mm=z)
@@ -3222,6 +3305,51 @@ class PickPlaceExecutor:
                 raise AbortException("Aborted during dwell")
 
             time.sleep(min(0.5, remaining))
+
+    def _post_aspirate_dwell_s(self) -> float:
+        """v7.21.7: resolved hold-in-liquid dwell (s) for this run.
+
+        ``post_aspirate_dwell_s`` set on the executor wins; None INHERITS the
+        global from the controller, which is what lets every workflow pick the
+        setting up without each page wiring it. Never raises and never returns a
+        negative — an unreadable value degrades to "no extra hold", i.e. the
+        pre-v7.21.7 behaviour, rather than stalling a run.
+        """
+        # `getattr`, not attribute access: several suites drive this executor as
+        # a `__new__` partial whose `__init__` never ran (the pattern this repo
+        # uses to exercise one method without standing up a whole run), so a bare
+        # read raises AttributeError there — and it would do the same on any
+        # older pickled/stand-in executor. Missing ⇒ inherit, same as None.
+        v = getattr(self, "post_aspirate_dwell_s", None)
+        if v is None:
+            getter = getattr(self.controller, "pump_post_aspirate_dwell_s", None)
+            if not callable(getter):
+                return 0.0
+            try:
+                v = getter()
+            except Exception:
+                return 0.0
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _settle_in_liquid(self, op, what: str = "reagent") -> None:
+        """Hold the needle SUBMERGED for the resolved post-aspirate dwell.
+
+        Call this immediately after a reagent ASPIRATE, while the tip is still
+        in the well and BEFORE the next travel (which retracts Z). Progress is
+        reported through the ordinary dwell path so the operator can see why the
+        run is waiting, and it is abort-aware (an Abort during the hold raises
+        rather than sitting out the full dwell).
+
+        A no-op at 0 s — including the ``on_dwell_tick`` / sub-step chatter — so
+        an operator who turns the hold off gets the legacy sequence exactly.
+        """
+        dwell = self._post_aspirate_dwell_s()
+        if dwell <= 0:
+            return
+        self._dwell(op, dwell, f"Holding in the {what} ({dwell:.1f}s)")
 
     def _check_abort(self):
         """Raise AbortException if abort was requested."""

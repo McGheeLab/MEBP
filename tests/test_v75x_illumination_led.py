@@ -15,6 +15,8 @@ via Marlin ``M106`` (no custom firmware needed). Covered here:
      that hosts a jog context — and N mounted views still emit ONE ``M106``.
   6. Shutting the software down turns the LED off, ordered before the link is
      closed, and a dying board can't derail the rest of the exit path.
+  7. The slider's 100 % is SCALED onto the LED's thermal ceiling (20 % duty),
+     not clipped at it — the emitter overheats above ~30 % over long soaks.
 """
 
 import os
@@ -165,7 +167,7 @@ class TestIlluminationControl(unittest.TestCase):
         w._chk_on.setChecked(True)       # user toggles on → queues a send
         self.assertTrue(w._send_timer.isActive())
         w._send_now()                    # fire the debounced send
-        self.assertEqual(ctrl.led_calls[-1], 255)
+        self.assertEqual(ctrl.led_calls[-1], _ceiling_level())
 
     def test_toggle_off_sends_zero(self):
         w, ctrl = self._make()
@@ -182,7 +184,7 @@ class TestIlluminationControl(unittest.TestCase):
         w._chk_on.setChecked(True)       # nothing to show → jump to full
         self.assertEqual(w.value(), 100)
         w._send_now()
-        self.assertEqual(ctrl.led_calls[-1], 255)
+        self.assertEqual(ctrl.led_calls[-1], _ceiling_level())
 
     def test_disconnected_never_sends(self):
         w, ctrl = self._make(connected=False)
@@ -336,6 +338,11 @@ def _level_from_pct_expected(pct: int) -> int:
     return _level_from_pct(pct)
 
 
+def _ceiling_level() -> int:
+    from gui.widgets.illumination_control import _CEILING_LEVEL
+    return _CEILING_LEVEL
+
+
 # ── 6. Shutdown turns the LED off ────────────────────────────────────────────
 
 class _Recorder:
@@ -440,6 +447,79 @@ class TestShutdownTurnsLedOff(unittest.TestCase):
         ctrl = StageController.__new__(StageController)
         ctrl.zp_stage = None
         self.assertFalse(ctrl.led_off())
+
+
+# ── 7. The slider is scaled onto the LED's thermal ceiling ───────────────────
+
+class TestThermalCeiling(unittest.TestCase):
+    """The emitter overheats above ~30 % duty over long soaks, so the slider's
+    100 % commands _MAX_DUTY_PCT of the electrical maximum. It is SCALED, not
+    clipped: clipping would make every setting above the ceiling behave
+    identically while looking different, which reads as a broken slider."""
+
+    def setUp(self):
+        from gui.widgets.illumination_control import illumination_state
+        illumination_state().reset()
+
+    def test_full_slider_is_the_ceiling_not_full_power(self):
+        from gui.widgets.illumination_control import _MAX_LEVEL, _level_from_pct
+        self.assertEqual(_level_from_pct(100), _ceiling_level())
+        # The point of the change: full slider must NOT be full PWM.
+        self.assertLess(_level_from_pct(100), _MAX_LEVEL)
+
+    def test_ceiling_is_twenty_percent_of_the_marlin_range(self):
+        from gui.widgets.illumination_control import _MAX_DUTY_PCT, _MAX_LEVEL
+        self.assertEqual(_MAX_DUTY_PCT, 20.0)
+        self.assertEqual(_ceiling_level(), round(_MAX_LEVEL * 0.20))  # 51
+
+    def test_no_slider_position_can_exceed_the_ceiling(self):
+        """The safety claim, over the whole range including out-of-band input."""
+        from gui.widgets.illumination_control import _level_from_pct
+        for pct in list(range(0, 101)) + [101, 500, -5]:
+            self.assertLessEqual(_level_from_pct(pct), _ceiling_level(),
+                                 f"pct={pct} exceeded the thermal ceiling")
+            self.assertGreaterEqual(_level_from_pct(pct), 0)
+
+    def test_the_range_is_scaled_not_clipped(self):
+        """Mid-slider is genuinely dimmer than full — a clipping implementation
+        would collapse everything above 20 % onto one brightness."""
+        from gui.widgets.illumination_control import _level_from_pct
+        mid, full = _level_from_pct(50), _level_from_pct(100)
+        self.assertLess(mid, full)
+        self.assertAlmostEqual(mid, full / 2.0, delta=1)
+        # Strictly non-decreasing across the whole slider.
+        levels = [_level_from_pct(p) for p in range(0, 101)]
+        self.assertEqual(levels, sorted(levels))
+        self.assertEqual(levels[0], 0)
+
+    def test_percent_round_trips_through_the_scaled_mapping(self):
+        from gui.widgets.illumination_control import (
+            _level_from_pct, _pct_from_level)
+        for pct in (0, 25, 50, 75, 100):
+            self.assertAlmostEqual(_pct_from_level(_level_from_pct(pct)), pct,
+                                   delta=1)
+
+    def test_the_widget_commands_the_scaled_level(self):
+        """The end-to-end claim: a 100 % slider puts the ceiling on the wire."""
+        from gui.widgets.illumination_control import IlluminationControl
+        ctrl = _FakeController(connected=True)
+        w = IlluminationControl(ctrl)
+        w.set_value(100)
+        w._chk_on.setChecked(True)
+        w._send_now()
+        self.assertEqual(ctrl.led_calls[-1], _ceiling_level())
+
+    def test_a_persisted_hundred_percent_is_now_the_safe_ceiling(self):
+        """A layout saved before this change stores a PERCENTAGE, so it needs no
+        migration — it simply now means the safe level."""
+        from gui.widgets.illumination_control import IlluminationControl
+        ctrl = _FakeController(connected=True)
+        w = IlluminationControl(ctrl)
+        w.set_value(100)                      # silent restore, as a layout does
+        w.set_on(True)
+        self.assertEqual(ctrl.led_calls, [])  # restore never commands hardware
+        w._send_now()
+        self.assertEqual(ctrl.led_calls[-1], _ceiling_level())
 
 
 if __name__ == "__main__":

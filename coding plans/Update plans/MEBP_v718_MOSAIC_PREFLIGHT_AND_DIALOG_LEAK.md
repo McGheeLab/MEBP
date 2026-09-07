@@ -155,8 +155,21 @@ change rewrites. Its *invariant* (the manager snapshot must precede the verify
 dialog, which is the 400-minute-scan guard) is untouched and still asserted; the
 matcher is now wrapper-agnostic so a cosmetic call change cannot break it again.
 
-`test_v75x_plate_mosaic` was excluded — it contains the `TestManualAlignPage`
-hang this repo documents as pre-existing.
+**`test_v75x_plate_mosaic` IS covered — class-by-class, 110 green** (70 + 40, one
+pre-existing skip), excluding only `TestManualAlignPage`, the hang this repo
+documents. That suite matters most here: it owns `TestMosaicWorker` and
+`TestFreshFrameCapture`, i.e. the worker this change edits. Its existing
+abort-path test still exercises the 8-consecutive-drop path, which also confirms
+the new preflight is not over-eager — it passes a camera that delivers and then
+stalls, rather than refusing everything. No test asserted the old
+"camera stopped delivering frames" wording (checked), so the clearer message
+broke nothing.
+
+⚠ A first combined run of these suites was killed at a 300 s timeout with **no
+summary line** — that was the `TestManualAlignPage` hang, not a failure; it is
+recorded here so the exit code is not mistaken for a real one later.
+
+Total: **692 green** (582 broad + 110 plate-mosaic).
 
 ## Needs verification on ME3B V1
 

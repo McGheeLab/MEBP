@@ -2,19 +2,19 @@
   "schema_version": "7.5.0",
   "metadata": {
     "name": "M_Sketch_1_copy",
-    "description": "M_Sketch_1: 16 shape(s), 1 layer(s), 108.8 mm path \u00b7 print height 0.10 mm above plate bottom",
-    "created": "2026-07-29T23:56:45.709974+00:00",
-    "modified": "2026-07-29T23:56:45.709974+00:00",
+    "description": "M_Sketch_1_copy: 16 shape(s), 1 layer(s), 109.6 mm path \u00b7 print height 0.10 mm above plate bottom",
+    "created": "2026-08-17T22:07:50.376742+00:00",
+    "modified": "2026-08-17T22:07:50.376742+00:00",
     "author": "Print Builder"
   },
   "objects": {
-    "M_Sketch_1": {
+    "M_Sketch_1_copy": {
       "object_type": "csv_import",
       "params": {
         "source_file": "config\\prints\\M_Sketch_1_copy.csv",
         "csv_path": "config\\prints\\M_Sketch_1_copy.csv",
         "source": "SketchTrajectory",
-        "num_waypoints": 278,
+        "num_waypoints": 286,
         "z_above_plate_bottom_mm": 0.1,
         "z_datum": "plate_bottom",
         "layer_height_mm": 0.01,
@@ -24,9 +24,9 @@
           "shapes": [
             {
               "kind": "circle",
-              "cx": -3.536776234084787,
-              "cy": 3.5904465715729046,
-              "radius": 1.3848956306250353,
+              "cx": -3.5823538086562285,
+              "cy": 3.33142398745727,
+              "radius": 1.2980862666478108,
               "rx": 5.0,
               "ry": 3.0,
               "width": 10.0,
@@ -38,13 +38,14 @@
               "color": "#89b4fa",
               "z_offset_mm": 0.0,
               "no_print": false,
-              "overlap_mode": "needle"
+              "overlap_mode": "needle",
+              "id": 1
             },
             {
               "kind": "circle",
-              "cx": -3.536776234084787,
-              "cy": 3.5904465715729046,
-              "radius": 1.5848956306250352,
+              "cx": -3.5823538086562285,
+              "cy": 3.33142398745727,
+              "radius": 1.485549673700652,
               "rx": 5.0,
               "ry": 3.0,
               "width": 10.0,
@@ -57,10 +58,11 @@
               "z_offset_mm": 1.0,
               "no_print": false,
               "start_point": [
-                -1.9518806034597516,
-                3.5904465715729046
+                -2.0968041349555766,
+                3.33142398745727
               ],
-              "overlap_mode": "needle"
+              "overlap_mode": "needle",
+              "id": 2
             },
             {
               "kind": "line",
@@ -73,12 +75,12 @@
               "height": 10.0,
               "points": [
                 [
-                  -3.3024722982394223,
-                  -2.4247304082410586
+                  -3.363035432047863,
+                  -2.1193441599046277
                 ],
                 [
-                  -3.278829109087044,
-                  2.2048530151894172
+                  -3.3405755741984193,
+                  2.0351835431067125
                 ]
               ],
               "filled": false,
@@ -88,19 +90,16 @@
               "z_offset_mm": 1.0,
               "no_print": false,
               "start_point": [
-                -3.278829109087044,
-                2.2048530151894172
+                -3.3405755741984193,
+                2.0351835431067125
               ],
-              "retrace_from": [
-                -1.9518806034597516,
-                3.5904465715729046
-              ]
+              "id": 3
             },
             {
               "kind": "circle",
-              "cx": -3.5444993264481366,
-              "cy": -3.782667265379435,
-              "radius": 1.3764661321597729,
+              "cx": -3.5895927946933153,
+              "cy": -3.5795212148603888,
+              "radius": 1.4776485611904284,
               "rx": 5.0,
               "ry": 3.0,
               "width": 10.0,
@@ -110,13 +109,14 @@
               "line_width_mm": 0.413,
               "ink_id": 1,
               "color": "#89b4fa",
-              "z_offset_mm": 0.0,
+              "z_offset_mm": 1.0,
               "no_print": false,
               "start_point": [
-                -3.417495054576958,
-                -2.4120728950753114
+                -3.3330018148104354,
+                -2.124321455572721
               ],
-              "overlap_mode": "needle"
+              "overlap_mode": "needle",
+              "id": 4
             },
             {
               "kind": "line",
@@ -129,12 +129,12 @@
               "height": 10.0,
               "points": [
                 [
-                  -3.4788265010137644,
-                  2.2058743978355047
+                  -3.528036536659746,
+                  2.0336409024604145
                 ],
                 [
-                  -3.502469690166143,
-                  -2.423709025594971
+                  -3.5501977006202443,
+                  -2.305746506497752
                 ]
               ],
               "filled": false,
@@ -144,9 +144,10 @@
               "z_offset_mm": 0.0,
               "no_print": false,
               "start_point": [
-                -3.502469690166143,
-                -2.423709025594971
-              ]
+                -3.5501977006202443,
+                -2.305746506497752
+              ],
+              "id": 5
             },
             {
               "kind": "line",
@@ -159,12 +160,12 @@
               "height": 10.0,
               "points": [
                 [
-                  -0.17322171062880515,
-                  -0.00504514571383563
+                  -0.4296368547809602,
+                  -0.03869164930694463
                 ],
                 [
-                  -2.4776076128435784,
-                  -3.0360604688428503
+                  -2.5895770167495433,
+                  -2.879713945822611
                 ]
               ],
               "filled": false,
@@ -174,17 +175,14 @@
               "z_offset_mm": 1.0,
               "no_print": false,
               "start_point": [
-                -0.17322171062880515,
-                -0.00504514571383563
+                -0.4296368547809602,
+                -0.03869164930694463
               ],
               "end_point": [
                 -0.003952447441304186,
                 0.23827292725153987
               ],
-              "retrace_from": [
-                -3.4788265010137644,
-                2.2058743978355047
-              ]
+              "id": 6
             },
             {
               "kind": "line",
@@ -197,12 +195,12 @@
               "height": 10.0,
               "points": [
                 [
-                  -2.318395780975438,
-                  -3.157104231974996
+                  -2.4403450545239145,
+                  -2.993170327018857
                 ],
                 [
-                  -0.014009878760664571,
-                  -0.12608890884598115
+                  -0.2804048925553309,
+                  -0.1521480305031901
                 ]
               ],
               "filled": false,
@@ -212,9 +210,10 @@
               "z_offset_mm": 0.0,
               "no_print": false,
               "start_point": [
-                -2.318395780975438,
-                -3.157104231974996
-              ]
+                -2.4403450545239145,
+                -2.993170327018857
+              ],
+              "id": 7
             },
             {
               "kind": "line",
@@ -227,12 +226,12 @@
               "height": 10.0,
               "points": [
                 [
-                  -0.014009878760664571,
-                  -0.12608890884598115
+                  -0.2804048925553309,
+                  -0.1521480305031901
                 ],
                 [
-                  2.3630210547251647,
-                  -3.2032538407873723
+                  1.9476266947509142,
+                  -3.036427141529477
                 ]
               ],
               "filled": false,
@@ -242,89 +241,16 @@
               "z_offset_mm": 0.0,
               "no_print": false,
               "start_point": [
-                -0.014009878760664571,
-                -0.12608890884598115
-              ]
+                -0.2804048925553309,
+                -0.1521480305031901
+              ],
+              "id": 8
             },
             {
               "kind": "circle",
-              "cx": 3.5865289627301298,
-              "cy": -3.8246969016614276,
-              "radius": 1.3778913407960212,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 0.0,
-              "no_print": false,
-              "start_point": [
-                2.415022133611899,
-                -3.0993305829161986
-              ],
-              "overlap_mode": "needle"
-            },
-            {
-              "kind": "line",
-              "cx": 0.0,
-              "cy": 0.0,
-              "radius": 5.0,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [
-                [
-                  2.521297422694343,
-                  -3.0809894087456486
-                ],
-                [
-                  0.1442664892085139,
-                  -0.003824476804257654
-                ]
-              ],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 1.0,
-              "no_print": false,
-              "start_point": [
-                2.521297422694343,
-                -3.0809894087456486
-              ]
-            },
-            {
-              "kind": "circle",
-              "cx": 3.516479568926808,
-              "cy": 3.61454872025146,
-              "radius": 1.522060527820974,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 1.0,
-              "no_print": false,
-              "start_point": [
-                2.485616022534713,
-                2.494732396441803
-              ],
-              "overlap_mode": "needle"
-            },
-            {
-              "kind": "circle",
-              "cx": 3.516479568926808,
-              "cy": 3.61454872025146,
-              "radius": 1.322060527820974,
+              "cx": 3.0944414997044394,
+              "cy": -3.618916308933459,
+              "radius": 1.2915210264711483,
               "rx": 5.0,
               "ry": 3.0,
               "width": 10.0,
@@ -337,122 +263,201 @@
               "z_offset_mm": 0.0,
               "no_print": false,
               "start_point": [
-                2.5816416045655304,
-                2.679710755890183
-              ],
-              "overlap_mode": "needle"
-            },
-            {
-              "kind": "line",
-              "cx": 0.0,
-              "cy": 0.0,
-              "radius": 5.0,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [
-                [
-                  3.413671231366163,
-                  2.2394828146467076
-                ],
-                [
-                  3.4663101652030743,
-                  -2.441443194582281
-                ]
-              ],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 1.0,
-              "no_print": false,
-              "start_point": [
-                3.413671231366163,
-                2.2394828146467076
-              ],
-              "retrace_from": [
-                2.5816416045655304,
-                2.679710755890183
-              ]
-            },
-            {
-              "kind": "circle",
-              "cx": 3.5865289627301298,
-              "cy": -3.8246969016614276,
-              "radius": 1.5778913407960211,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 1.0,
-              "no_print": false,
-              "start_point": [
-                3.4562277285807337,
-                -2.2521948597746104
-              ],
-              "overlap_mode": "needle"
-            },
-            {
-              "kind": "line",
-              "cx": 0.0,
-              "cy": 0.0,
-              "radius": 5.0,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [
-                [
-                  3.666297520476928,
-                  -2.4391942547054866
-                ],
-                [
-                  3.6136585866400166,
-                  2.241731754523502
-                ]
-              ],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 0.0,
-              "no_print": false,
-              "start_point": [
-                3.666297520476928,
-                -2.4391942547054866
-              ]
-            },
-            {
-              "kind": "circle",
-              "cx": -3.5444993264481366,
-              "cy": -3.782667265379435,
-              "radius": 1.5764661321597728,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.413,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 1.0,
-              "no_print": false,
-              "start_point": [
-                -2.300446039869411,
-                -2.8143817258821926
+                1.9012316575397776,
+                -3.1246726095517956
               ],
               "overlap_mode": "needle",
-              "retrace_from": [
-                3.6136585866400166,
-                2.241731754523502
-              ]
+              "id": 9
+            },
+            {
+              "kind": "circle",
+              "cx": 3.0944414997044394,
+              "cy": -3.618916308933459,
+              "radius": 1.4789844335239892,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 1.0,
+              "no_print": false,
+              "start_point": [
+                1.70465074126472,
+                -3.1130738410031507
+              ],
+              "overlap_mode": "needle",
+              "id": 10
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.0959818307281717,
+                  -2.9218266065698657
+                ],
+                [
+                  -0.13204975657807433,
+                  -0.037547495543579
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 1.0,
+              "no_print": false,
+              "start_point": [
+                2.0959818307281717,
+                -2.9218266065698657
+              ],
+              "id": 11
+            },
+            {
+              "kind": "circle",
+              "cx": 3.2080879015832235,
+              "cy": 3.422567484922782,
+              "radius": 1.485819578159413,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 1.0,
+              "no_print": false,
+              "start_point": [
+                2.069884070256821,
+                2.4675010698522306
+              ],
+              "overlap_mode": "needle",
+              "id": 12
+            },
+            {
+              "kind": "circle",
+              "cx": 3.19335563257726,
+              "cy": 3.374681403317308,
+              "radius": 1.2695822212527315,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.2956254346555736,
+                2.476951205395622
+              ],
+              "overlap_mode": "needle",
+              "id": 13
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.9572445137004726,
+                  2.065142644065815
+                ],
+                [
+                  3.006583883103956,
+                  -2.3223690451958108
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 1.0,
+              "no_print": false,
+              "start_point": [
+                2.9572445137004726,
+                2.065142644065815
+              ],
+              "id": 14
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  3.2653923573709576,
+                  -2.3387591443321076
+                ],
+                [
+                  3.197934073682417,
+                  2.105107465720775
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                3.2653923573709576,
+                -2.3387591443321076
+              ],
+              "end_point": [
+                3.606497289785741,
+                2.1742010879434783
+              ],
+              "id": 16
+            },
+            {
+              "kind": "circle",
+              "cx": -3.5895927946933153,
+              "cy": -3.5795212148603888,
+              "radius": 1.2901851541375868,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -2.6772941232164165,
+                -2.66722254338349
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.007,
+              "id": 15
             }
           ],
           "inks": [
@@ -475,10 +480,51 @@
           "outline_points_per_mm": 2.0,
           "flow_factor": 1.0,
           "extrusion_multiplier": 1.0,
-          "overlap_travel_enabled": true,
-          "overlap_travel_max_mm": 8.5,
-          "overlap_travel_pause_pump": true,
-          "overlap_travel_speed_factor": 1.0
+          "single_needle": true,
+          "constraints": [
+            {
+              "id": 1,
+              "kind": "point_on",
+              "refs": [
+                [
+                  16,
+                  "p0"
+                ],
+                [
+                  9,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 2,
+              "kind": "point_on",
+              "refs": [
+                [
+                  16,
+                  "p1"
+                ],
+                [
+                  13,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 3,
+              "kind": "point_on",
+              "refs": [
+                [
+                  3,
+                  "p0"
+                ],
+                [
+                  4,
+                  "shape"
+                ]
+              ]
+            }
+          ]
         }
       },
       "position": [

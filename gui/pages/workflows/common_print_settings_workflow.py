@@ -146,6 +146,20 @@ class CommonPrintSettingsWorkflowPage(QWidget):
             self._dspin(0.0, 30.0, 0.05, 2, " s"),
             "Pre-flow lead-in printing workflows use to prime the needle "
             "(prime volume = flow × time).")
+        # v7.21.7 — NOT a duplicate of the settle dwell above, and the help text
+        # has to say why: the settle dwell brackets a pump move that already
+        # blocks until the PLUNGER has finished, whereas this covers the FLUID
+        # still being drawn afterwards through a compliant column.
+        self._add_row(
+            pump, "pump_post_aspirate_dwell_s", "Hold in liquid after aspirating",
+            self._dspin(0.0, 120.0, 0.5, 2, " s"),
+            "Extra time the needle stays IN THE LIQUID after a reagent aspirate "
+            "(ink / oil / buffer) finishes, before Z retracts and the stage "
+            "travels on. The pump move already waits for the plunger, but the "
+            "fluid column is compressible — with a fine bore or a viscous ink "
+            "liquid keeps being drawn in after the plunger stops, so lifting the "
+            "needle too early finishes the aspirate in AIR. Raise it if a pickup "
+            "ends with air in the needle. 0 = no extra hold.")
 
         # ── Pressure relief / compliance (per pump) ──
         self._relief_spins: dict = {}

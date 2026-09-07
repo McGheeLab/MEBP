@@ -28,6 +28,7 @@ uniformly by the flow knob).
 from __future__ import annotations
 
 import bisect
+import contextlib
 import copy
 import logging
 import math
@@ -39,10 +40,11 @@ from typing import Optional
 import numpy as np
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox,
     QComboBox, QFrame, QSizePolicy, QMessageBox, QSplitter, QCheckBox, QSpinBox,
-    QButtonGroup, QStackedWidget, QScrollArea,
+    QButtonGroup, QStackedWidget, QScrollArea, QListWidget, QListWidgetItem,
 )
 
 from gui.styles import COLORS
@@ -53,6 +55,7 @@ from gui.widgets.jog_well_plate import WellPlateNavigator
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.print_trajectory_monitor import PrintTrajectoryMonitorView
+from gui.widgets.section_stack import SectionStack, wire_section_promotion
 # v7.6: the measured-calibration store is read by the two-parameter surface
 # (resolution default, stage-max cap, the machine-characterised gate), so it is
 # imported once here rather than locally at each site.
@@ -74,10 +77,16 @@ from SupportClasses.PrintManager import (
     PrintManager, PrintSettings, PrintState, build_well_plate_job,
 )
 from SupportClasses.PrintFileManager import PrintFileManager
+from SupportClasses.WorkflowLayoutStore import WorkflowLayoutStore
 from SupportClasses.PhysicalModels import (
     needle_orifice_area_mm2, needle_orifice_od_mm,
 )
 from SupportClasses.PickAndPlaceManager import PickPlaceExecutor, AbortException
+from SupportClasses.PrintQueue import (
+    ORDER_INK, ORDER_PLATE, QueuedPrint, count_ink_swaps, order_queue,
+    plate_index_from_names, queue_from_state, queue_to_state,
+)
+from SupportClasses import PrintQueue as _pq
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +161,15 @@ def _overlay_channels(sim_result, *, vol_per_mm: float,
     return speeds, flows, errors, [t_base + t for t in times]
 
 
+class _QueueResolveError(Exception):
+    """v7.19: a queued print cannot be resolved into runnable units.
+
+    Carries an operator-facing reason, which ``_resolve_queue`` collects into the
+    "NOT running" list of the confirm dialog — an entry that cannot run is named,
+    never silently dropped.
+    """
+
+
 class _PrintBridge(QObject):
     """Bridges PrintManager callbacks (daemon thread) → Qt signals so GUI
     updates land on the main thread (queued across threads)."""
@@ -169,6 +187,18 @@ class _PrintBridge(QObject):
     # ink-swap sequence on one worker thread; this fires when it finishes
     # (empty string = ok, else the reason).
     multi_done = Signal(str)
+    # v7.19: the plate-wide print QUEUE finished ("" = ok, else the reason).
+    # Deliberately a SEPARATE signal from `multi_done`: that handler writes
+    # multi-ink-specific status text and is referenced from four coupling points,
+    # so sharing it would make the status line lie about which engine ran.
+    queue_done = Signal(str)
+    # v7.19: the queue advanced to a unit — (index, total, label). Carries the
+    # GUI-thread work (status text, live-sampling toggle) OFF the worker, because
+    # `_set_print_live` drives a QTimer that may only be touched here.
+    queue_unit = Signal(int, int, str)
+    # v7.19: the queue parked at a well boundary (True) or resumed (False), so the
+    # operator can go run another workflow mid-batch.
+    queue_held = Signal(bool)
     # v7.5.x: background XYPathSimulator run for the planned path finished —
     # (generation, predicted segments in zero-ref µm, caption text, overlays).
     # v7.6: overlays = {mode: {values, unit, vmin, vmax}} for the optional
@@ -186,9 +216,26 @@ class QuickPrintWorkflowPage(QWidget):
 
     Signals:
         back_requested: User clicked the Back button.
+        print_state_changed: A print reached a terminal state (COMPLETED /
+            ABORTED / ERROR). Carries the :class:`PrintState`. Emitted for
+            hosts that EMBED this page (see the ``embedded`` ctor kwarg) and
+            need to act on a finished run — e.g. the Print Calibrator, which
+            then reads :attr:`last_log_path`.
     """
 
     back_requested = Signal()
+    #: v7.20: EVERY PrintState transition of this page's own PrintManager, for an
+    #: embedding host. On a terminal state it is emitted AFTER ``_last_log_path``
+    #: is captured, so a slot can read it immediately.
+    #: ⚠ RE-ENTRANT: ``PrintManager._set_state`` runs on the CALLING thread and
+    #: ``pm.start()`` is called from the GUI thread, so a slot can execute inside
+    #: ``pm.start()``. Read state there; defer any real work with
+    #: ``QTimer.singleShot(0, …)``.
+    print_state_changed = Signal(object)
+    #: v7.20: the post-print cleanup worker finished — "" = ok, else the reason.
+    #: A host must wait for this (or poll :meth:`cleanup_running`) before moving
+    #: the stage or trusting where it is: the cleanup travels to waste/wash/oil.
+    cleanup_finished = Signal(str)
 
     # v7.5.x print-setup routine step 4: pump pre-flow lead-in (seconds) — the
     # pump runs at the print flow rate for this long after the confirmed descent
@@ -206,17 +253,80 @@ class QuickPrintWorkflowPage(QWidget):
     # cross-section is unknown (can't auto-calculate). Plain prints still flow.
     _FLOW_FALLBACK_UL_S = 0.25
 
+    #: v7.20: combo userData for a host-supplied object. ONE slot — a host
+    #: pushes one object at a time — and a STABLE token, which is what lets
+    #: ``_refresh_objects``' existing ``findData(prev)`` restore the selection
+    #: through a rebuild with no second selection path.
+    _EXTERNAL_DATA = "external:0"
+
+    # v7.21 — ids for the Setup column's built-in cards. Stable strings, never
+    # ordinals: the stored order is keyed by these, so renumbering when a card is
+    # added would silently reshuffle every operator's saved arrangement. Kept
+    # distinct from a settings section's slug id (which comes from its title) by
+    # the `builtin_` prefix, so a section titled "Queue" cannot collide with the
+    # queue card.
+    SEC_OBJECT = "builtin_object"
+    SEC_QUEUE = "builtin_queue"
+    SEC_PARAMS = "builtin_params"
+    SEC_READINESS = "builtin_readiness"
+    SEC_STATUS = "builtin_status"
+
     def __init__(self, controller, settings, camera_manager=None,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *,
+                 embedded: bool = False, owns_camera: bool = True,
+                 settings_id: str = "quick_print",
+                 settings_title: str = "Quick Print"):
+        """v7.20 embedding kwargs, for a host that mounts this page inside its
+        own shell (the Print Calibrator). All defaults are today's behaviour.
+
+        ``embedded=True`` drops the "← Back to Workflows" button and the page
+        title from the header (the host supplies its own) and hides the v7.19
+        plate-wide QUEUE surface. The queue is hidden rather than merely
+        disabled because it stores the object combo's userData as a *reference*
+        (``QueuedPrint.object_data``) and applies a per-well snapshot on every
+        plate click — either of which would overwrite, or persist a dangling
+        reference to, a host-supplied object. The ⚙ Settings button and the
+        summary line are KEPT: they are the only route to pump / flow / ink /
+        prep, and the only statement of what will actually run.
+
+        ``owns_camera=False`` cedes the microscope lifecycle to the host, while
+        the feed is still BOUND to the right slot here. Load-bearing, and a
+        separate flag from ``embedded`` because it is a different fact: Qt
+        delivers ``showEvent`` to a CHILD BEFORE ITS PARENT and hides an
+        inactive tab's page, so an embedded instance would otherwise win the
+        start race, claim the stop, and then kill the host's live view the
+        moment the operator looks at another tab. Ownership is declared, not
+        won. (Same shape as ``FluorescenceMosaicWorkflowPage``.)
+
+        ``settings_id`` / ``settings_title`` name the
+        :class:`WorkflowSettingsStore` directory (``config/workflows/<id>/``).
+        Also load-bearing: the settings popout auto-saves ``__last__.json`` on
+        hide/close and this page hides its popout on every ``hideEvent``, so two
+        live instances sharing ``"quick_print"`` would silently overwrite each
+        other's last-used values.
+        """
         super().__init__(parent)
         self._controller = controller
         self._settings = settings
         self._camera_manager = camera_manager
         self._hw_config = None
+        self._embedded = bool(embedded)
+        self._owns_camera = bool(owns_camera)
 
         # Live camera + trajectory monitor state.
         self._camera_view: CameraFeedView | None = None
         self._camera_started_by_us = False
+
+        # v7.20: caller-supplied objects (the Print Calibrator's calibration
+        # lines). A LIST: each entry becomes its own print segment, so
+        # build_well_plate_job inserts the lift → hop → lower → re-prime between
+        # them — which is what the calibrator's second line measures.
+        self._external_objs: list[dict] = []
+        self._external_label = "External object"
+        self._external_lock = False
+        # v7.20: forces the pre-flow prime for a calibration run. None = use the
+        # settings-popout value (today's behaviour).
+        self._prime_override_s: float | None = None
 
         # Calibration data (pushed in by MainWindow fanout).
         self._plate = None
@@ -243,6 +353,9 @@ class QuickPrintWorkflowPage(QWidget):
         self._bridge.prepositioned.connect(self._on_prepositioned)
         self._bridge.cleanup_done.connect(self._on_cleanup_done)
         self._bridge.multi_done.connect(self._on_multi_done)
+        self._bridge.queue_done.connect(self._on_queue_done)
+        self._bridge.queue_unit.connect(self._on_queue_unit)
+        self._bridge.queue_held.connect(self._on_queue_held)
         self._bridge.predicted.connect(self._on_predicted)
         self._bridge.vel_sample.connect(self._on_vel_sample)
         # v7.6: fast live-position sampling while a print runs (see
@@ -260,6 +373,30 @@ class QuickPrintWorkflowPage(QWidget):
         self._ink_map_last: dict[str, str] = {}    # ink name → mapped, remembered
         self._multi_thread = None
         self._multi_abort_requested = False
+
+        # ── v7.19: the plate-wide print queue ─────────────────────────
+        # One QueuedPrint per well, each a COMPLETE set of inputs, so two wells
+        # can print different objects with different inks at different heights.
+        # Empty ⇒ every existing single-print path behaves exactly as before.
+        self._queue: list = []
+        self._queue_thread = None
+        self._queue_abort_requested = False
+        self._queue_results: list[dict] = []
+        self._queue_ran = 0
+        self._queue_total = 0
+        self._queue_swaps = 0
+        self._queue_is_held = False
+        self._hold_requested = False
+        self._hold_event = threading.Event()
+        # Guards the write-back sink while a snapshot is being APPLIED to the
+        # widgets — without it, applying an entry would write itself back through
+        # every intermediate half-applied state.
+        self._applying_snapshot = False
+        # Display-only polyline cache keyed by CONFIG identity (object + size +
+        # resolution), NOT by well: a real queue is usually "the same print in 40
+        # wells", so this normally holds one entry. Regenerating geometry per well
+        # per repaint would make a 384-well plate unusable.
+        self._glyph_cache: dict[tuple, tuple] = {}
 
         # v7.5.x: pre-position runs off the GUI thread. Holds the print context
         # captured at launch so the confirm-and-run continuation
@@ -303,8 +440,14 @@ class QuickPrintWorkflowPage(QWidget):
 
         # Comprehensive settings popout (scrollable, saveable). Built eagerly so
         # the config widgets exist for _build_settings() / _on_print() + tests.
+        # v7.21: kept because the layout store is keyed by it — the arrangement
+        # belongs to the surface the operator sees, and an embedded instance runs
+        # under its own id (see _hide_queue_surface).
+        self._settings_id = str(settings_id or "quick_print")
+        self._layout_store = None
         self._settings_dialog = WorkflowSettingsDialog(
-            "quick_print", "Quick Print",
+            self._settings_id,
+            str(settings_title or "Quick Print"),
             parent=self, on_change=self._on_settings_changed,
             # v7.6: upgrade saved profiles from the old speed_pct knob.
             migrate=self._migrate_legacy_settings,
@@ -315,10 +458,26 @@ class QuickPrintWorkflowPage(QWidget):
         # v7.7: the abstract-ink → configured-ink mapping is rebuilt per object
         # (so it can't be a fixed registered field) but it IS a real operator
         # choice; ride it along with the profile instead of losing it on restart.
+        # v7.19: the plate-wide queue rides along too, so a saved profile carries
+        # the whole plate layout.
         self._settings_dialog.set_extra_state(
-            lambda: {"ink_map_last": dict(self._ink_map_last)},
-            self._restore_extra_state)
+            self._collect_extra_state, self._restore_extra_state)
         self._build_settings_dialog(self._settings_dialog)
+
+        # v7.19: ONE debounced sink that notices "the operator changed the
+        # print". The alternative — hooking _on_object_changed, _on_settings_changed
+        # and the four inline per-widget lambdas — is four seams, and a fifth
+        # would be forgotten the next time a field is added.
+        self._writeback_timer = QTimer(self)
+        self._writeback_timer.setSingleShot(True)
+        self._writeback_timer.setInterval(120)
+        self._writeback_timer.timeout.connect(self._write_back)
+        for _w in self._snapshot_widgets():
+            for _signame in ("valueChanged", "currentIndexChanged"):
+                _sig = getattr(_w, _signame, None)
+                if _sig is not None:
+                    _sig.connect(lambda *_: self._queue_writeback_soon())
+                    break
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(s(12), s(10), s(12), s(12))
@@ -333,6 +492,11 @@ class QuickPrintWorkflowPage(QWidget):
 
         outer.addWidget(self._build_run_row())
 
+        # v7.21: hand the popout somewhere to move a section TO, then re-apply
+        # the stored arrangement. After the layout exists, because promotion
+        # reparents cards INTO the stack the setup zone just built.
+        self._wire_section_promotion()
+
         self._refresh_objects()
         self._on_object_changed()
         self._refresh_ink_combo()
@@ -341,6 +505,63 @@ class QuickPrintWorkflowPage(QWidget):
         self._settings_dialog.load_last()
         self._refresh_setup_status()
         self._update_settings_summary()
+        if self._embedded:
+            self._hide_queue_surface()
+
+    # ── v7.21: customisable Setup column ──────────────────────────
+
+    def _wire_section_promotion(self) -> None:
+        """Register the Setup column as the settings popout's promotion host and
+        restore the operator's stored arrangement.
+
+        Best-effort throughout: a page built via ``__new__`` for a partial-page
+        test has no stack, and an embedded instance deliberately gets none of
+        this (see below), so every step is guarded.
+        """
+        stack = getattr(self, "_section_stack", None)
+        dlg = getattr(self, "_settings_dialog", None)
+        if stack is None or dlg is None:
+            return
+        # ⚠ NOT when embedded. An embedded instance shares this page's class but
+        # not its purpose: the host owns the surrounding layout, its own settings
+        # id keeps a separate profile, and letting the operator move a section
+        # onto an embedded surface would put a card inside someone else's page
+        # with no way to see it had happened.
+        if self._embedded:
+            return
+        # The SHARED helper, not a copy: it owns the restore ORDER (promotions
+        # first so the cards exist, then the stored order), and that ordering is
+        # exactly the kind of thing that drifts between seven hand-written copies.
+        self._layout_store = wire_section_promotion(
+            self, dlg, stack,
+            settings=self._settings, workflow_id=self._settings_id)
+
+    def _hide_queue_surface(self) -> None:
+        """v7.20: hide the v7.19 plate-wide QUEUE when embedded.
+
+        Hidden, not disabled, and not removed — every widget stays alive so the
+        queue's own methods keep working untouched. The queue is wrong for an
+        embedded host in three concrete ways: ``QueuedPrint.object_data`` stores
+        the object combo's userData as a REFERENCE (so a host-supplied object
+        would persist as a dangling one), the per-well snapshot write-back
+        re-applies stored widget values on every plate click (overwriting the
+        host's object), and "Apply print to wells" / "Run all queued" would stamp
+        a one-off calibration print across the whole plate. Getattr-guarded so
+        this survives the queue moving or being renamed.
+        """
+        for attr in ("_queue_card", "_apply_btn", "_run_all_btn", "_hold_btn"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.setVisible(False)
+                except Exception:
+                    pass
+        nav = getattr(self, "_navigator", None)
+        if nav is not None and hasattr(nav, "set_multi_select_enabled"):
+            try:
+                nav.set_multi_select_enabled(False)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         # Re-scan config/prints each time the page is shown so prints created
@@ -379,8 +600,13 @@ class QuickPrintWorkflowPage(QWidget):
             return
         cam_idx = self._resolve_microscope_cam_idx()
         try:
+            # BIND unconditionally: the view must show the right slot even when
+            # the host owns start/stop, so this must NOT be skipped by the
+            # ownership gate below (v7.20).
             if self._camera_view.cam_idx != cam_idx:
                 self._camera_view.set_camera(cam_idx)
+            if not self._owns_camera:
+                return          # the host starts/stops it — see the ctor doc
             if not self._camera_manager.is_running(cam_idx):
                 self._camera_manager.start(cam_idx)
                 self._camera_started_by_us = True
@@ -388,6 +614,12 @@ class QuickPrintWorkflowPage(QWidget):
             logger.debug("Quick Print camera start failed: %s", e)
 
     def _stop_camera(self) -> None:
+        # v7.20: THE load-bearing half of `owns_camera`. A host that stacks this
+        # page in a tab gets a hideEvent every time the operator looks at another
+        # tab; stopping the microscope there would blank the host's own live view
+        # in the middle of a measurement.
+        if not self._owns_camera:
+            return
         if (self._camera_manager is None or self._camera_view is None
                 or not self._camera_started_by_us):
             return
@@ -403,18 +635,21 @@ class QuickPrintWorkflowPage(QWidget):
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(s(8))
-        back = QPushButton("← Back to Workflows")
-        back.setCursor(Qt.PointingHandCursor)
-        back.clicked.connect(self.back_requested.emit)
-        row.addWidget(back)
+        # v7.20: an embedding host owns the Back button and the page title, so
+        # showing ours too would give the operator two of each.
+        if not self._embedded:
+            back = QPushButton("← Back to Workflows")
+            back.setCursor(Qt.PointingHandCursor)
+            back.clicked.connect(self.back_requested.emit)
+            row.addWidget(back)
 
-        title = QLabel("Quick Print")
-        title.setStyleSheet(
-            f"color: {COLORS['blue']};"
-            f"font-size: {sf(14)}pt;"
-            f"font-weight: 600;"
-        )
-        row.addWidget(title)
+            title = QLabel("Quick Print")
+            title.setStyleSheet(
+                f"color: {COLORS['blue']};"
+                f"font-size: {sf(14)}pt;"
+                f"font-weight: 600;"
+            )
+            row.addWidget(title)
 
         self._settings_summary = QLabel("")
         self._settings_summary.setStyleSheet(
@@ -535,6 +770,80 @@ class QuickPrintWorkflowPage(QWidget):
             f"color: {COLORS['overlay0']}; font-size: {sf(9)}pt;")
         row.addWidget(hint)
         return frame
+
+    def _build_queue_card(self) -> QWidget:
+        """The queue: a read-only readout plus the actions on it.
+
+        The LIST is deliberately not selectable. The plate is the map, and the
+        map is the single answer to "which wells" — a second selection model in a
+        list beside it would be two homes for one fact. Rows are keyed by well
+        NAME, never by row index.
+        """
+        card = Card("Queue", compact=True)
+        self._queue_list = QListWidget()
+        self._queue_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._queue_list.setFocusPolicy(Qt.NoFocus)
+        self._queue_list.setMaximumHeight(s(150))
+        self._queue_list.setStyleSheet(f"font-size: {sf(9)}pt;")
+        self._queue_list.itemDoubleClicked.connect(
+            lambda it: self._on_well_clicked(str(it.data(Qt.UserRole) or "")))
+        card.add_widget(self._queue_list)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(s(6))
+        self._queue_remove_btn = QPushButton("Remove selected")
+        self._queue_remove_btn.setToolTip(
+            "Remove the queued prints in the wells selected on the plate. With "
+            "nothing selected, removes the well being edited.")
+        self._queue_remove_btn.clicked.connect(self._on_queue_remove)
+        btns.addWidget(self._queue_remove_btn)
+        self._queue_select_btn = QPushButton("Select all queued")
+        self._queue_select_btn.setToolTip(
+            "Select every well that holds a print, so new parameters can be "
+            "stamped over the whole layout in one click.")
+        self._queue_select_btn.clicked.connect(
+            lambda: self._navigator.set_selected_wells(
+                [qp.well for qp in self._queue]))
+        btns.addWidget(self._queue_select_btn)
+        self._queue_clear_btn = QPushButton("Clear all")
+        self._queue_clear_btn.setToolTip("Remove every queued print.")
+        self._queue_clear_btn.clicked.connect(self._on_queue_clear)
+        btns.addWidget(self._queue_clear_btn)
+        btns.addStretch(1)
+        card.add_layout(btns)
+
+        opts = QHBoxLayout()
+        opts.setSpacing(s(10))
+        self._group_by_ink_check = QCheckBox("Group by ink")
+        self._group_by_ink_check.setToolTip(
+            "Run every well using one ink before switching, instead of in plate "
+            "order. Each ink swap is a full waste → wash → buffer cycle, so this "
+            "can save a lot of time — but it changes how long each well sits "
+            "before the next handling step.")
+        self._group_by_ink_check.toggled.connect(
+            lambda *_: self._refresh_queue_ui())
+        opts.addWidget(self._group_by_ink_check)
+        self._clean_between_check = QCheckBox("Clean between every print")
+        self._clean_between_check.setToolTip(
+            "Wash the needle between every queued print, not just when the ink "
+            "changes. Slower, but it resets the syringe each time — the remedy "
+            "when a long same-ink batch will not fit the plunger envelope.")
+        self._clean_between_check.toggled.connect(
+            lambda *_: self._refresh_queue_ui())
+        opts.addWidget(self._clean_between_check)
+        opts.addStretch(1)
+        card.add_layout(opts)
+
+        note = QLabel(
+            "Each queued print keeps its own object, size, pump, ink, speed, "
+            "resolution, height and extrusion ×. Prep / cleanup / wash and the "
+            "between-lines settings are shared by the whole run.")
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: {sf(8)}pt;")
+        card.add_widget(note)
+        self._queue_card = card
+        return card
 
     def _build_status_strip(self) -> QFrame:
         """The 'confirm all is setup' readiness surface, kept on the page so the
@@ -831,13 +1140,27 @@ class QuickPrintWorkflowPage(QWidget):
             "from Hardware Setup → Pump (Prime time).")
         sec = dlg.add_section("Advanced")
         sec.add("travel_speed", "Travel speed", self._travel_speed, 10.0)
-        sec.add("preflow", "Pre-flow lead-in", self._preflow, self._prime_default_s())
+        # v7.20: LINKED to the global prime time, not merely seeded from it.
+        # It was `sec.add(...)`, seeded once at build time — when `_hw_config` is
+        # still None, so it took the 0.25 s fallback — and then restored from the
+        # saved profile on top. So a change to `pump_prime_time_s` (Hardware
+        # Setup → Pump, the Common Print Settings page, or the Print Calibrator
+        # applying a MEASURED prime time) reached every workflow that links it
+        # and silently did NOT reach Quick Print: the calibration would appear to
+        # succeed and change nothing. `overridable=True` keeps the per-run knob
+        # the comment below describes — unchecked INHERITS the global live
+        # (the widget is force-set, so `_preflow_s()`'s read is already the
+        # effective value), checked keeps a local value — and the dialog's
+        # `_migrate_common_links` promotes an existing customised profile value
+        # to an explicit override, so saved profiles keep their prime.
+        sec.add_common("preflow", "Pre-flow lead-in", self._preflow,
+                       self._prime_default_s(),
+                       common_key="pump_prime_time_s", overridable=True)
 
         # ── Common — Pump (global) ──
-        # (Prime time is already surfaced above via the per-run Pre-flow knob,
-        # which seeds from the global prime time — so only settle here. Pressure
-        # relief / compliance is now per-pump µL on the Common Print Settings
-        # page, not a global proxied here.)
+        # (Prime time is linked above via the per-run Pre-flow knob — so only
+        # settle here. Pressure relief / compliance is now per-pump µL on the
+        # Common Print Settings page, not a global proxied here.)
         self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
         sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
         sec.add_note(
@@ -845,6 +1168,23 @@ class QuickPrintWorkflowPage(QWidget):
             "page — one value used everywhere).")
         sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
                        0.0, common_key="pump_settle_time_s", overridable=False)
+        # v7.21.7: hold the needle in the liquid after a reagent aspirate. A
+        # SEPARATE knob from the settle dwell above, because they cover different
+        # halves of the same move: the settle dwell brackets a pump move that
+        # already blocks until the PLUNGER has drained from Marlin's planner,
+        # while this one covers the FLUID still being drawn in afterwards through
+        # a compliant column. Lift Z inside that window and the tail of the
+        # aspirate is air.
+        self._g_hold_liquid = self._dspin(0.0, 120.0, 2.0, " s", 2, 0.5)
+        self._g_hold_liquid.setToolTip(
+            "Extra time the needle stays IN THE LIQUID after a reagent aspirate "
+            "(ink / oil / buffer) finishes, before Z retracts and the stage "
+            "travels on. Raise it if a pickup ends with air drawn into the "
+            "needle; 0 = no extra hold.")
+        sec.add_common("g_hold_liquid", "Hold in liquid after aspirating",
+                       self._g_hold_liquid, 2.0,
+                       common_key="pump_post_aspirate_dwell_s",
+                       overridable=False)
 
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
@@ -876,6 +1216,17 @@ class QuickPrintWorkflowPage(QWidget):
             return self._PREFLOW_S
 
     def _preflow_s(self) -> float:
+        # v7.20: a host override wins over the popout. THE single choke point —
+        # `_resolved_print_kinematics` is the only consumer and it is what
+        # `_build_settings` stamps into `prime_amounts_uL`, so forcing it here
+        # forces the prime everywhere it matters (the job's EXTRUDE prime, the
+        # pickup volume, the syringe budget and the readiness numbers).
+        ov = getattr(self, "_prime_override_s", None)
+        if ov is not None:
+            try:
+                return max(0.0, float(ov))
+            except (TypeError, ValueError):
+                pass
         w = getattr(self, "_preflow", None)
         if w is None:
             return self._prime_default_s()
@@ -987,12 +1338,19 @@ class QuickPrintWorkflowPage(QWidget):
 
     def _build_setup_zone(self) -> QWidget:
         """What to print, where, and whether the machine can honour it."""
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(s(8))
-
-        ll.addWidget(self._build_object_row())
+        # v7.21: the left column is a SectionStack, so the operator can order
+        # these cards — and interleave sections moved out of the ⚙ popout — into
+        # whatever sequence matches how they actually work. The default order is
+        # the pre-v7.21 one, and with nothing promoted and nothing reordered the
+        # column renders exactly as it did.
+        #
+        # The built-in cards are ordinary stack entries: the alternative (a fixed
+        # block plus a reorderable tail) would mean two placement rules for one
+        # column, and "move Readiness above Queue" — the operator's own example
+        # of a customisable workflow — would be impossible.
+        # Persistence + the ↩ handler are attached later by
+        # wire_section_promotion, the one place that knows the restore order.
+        self._section_stack = SectionStack()
 
         # The two driving parameters, in front of the operator at last.
         param_card = Card("Print parameters — everything derives from these")
@@ -1007,7 +1365,6 @@ class QuickPrintWorkflowPage(QWidget):
         self._derived_lbl.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         param_card.add_widget(self._derived_lbl)
-        ll.addWidget(param_card)
 
         # Readiness checklist (Stage 1b fills it; the legacy one-line strip is
         # kept underneath as the compact summary and for existing tests).
@@ -1017,8 +1374,28 @@ class QuickPrintWorkflowPage(QWidget):
         self._ready_layout.setContentsMargins(0, 0, 0, 0)
         self._ready_layout.setSpacing(s(3))
         self._ready_card.add_widget(self._ready_host)
-        ll.addWidget(self._ready_card)
-        ll.addWidget(self._build_status_strip())
+
+        # v7.19: the queue sits with the config it describes, and reads in the
+        # operator's own DEFAULT sequence — what to print → what's queued → the
+        # parameters that get stamped → readiness. It goes in the left column
+        # because that is the one surface here (a QScrollArea) that absorbs an
+        # arbitrarily long list without fighting the plate for height.
+        for sid, label, w in (
+                (self.SEC_OBJECT, "Object", self._build_object_row()),
+                (self.SEC_QUEUE, "Queue", self._build_queue_card()),
+                (self.SEC_PARAMS, "Print parameters", param_card),
+                (self.SEC_READINESS, "Readiness", self._ready_card),
+                (self.SEC_STATUS, "Setup status", self._build_status_strip())):
+            self._section_stack.add(sid, w, label=label)
+        self._builtin_section_ids = [
+            self.SEC_OBJECT, self.SEC_QUEUE, self.SEC_PARAMS,
+            self.SEC_READINESS, self.SEC_STATUS]
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(s(8))
+        ll.addWidget(self._section_stack)
         ll.addStretch(1)
 
         scroll = QScrollArea()
@@ -1026,27 +1403,106 @@ class QuickPrintWorkflowPage(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(left)
 
+        # ── v7.19 right pane: the ACTIVE print's preview ABOVE the plate that
+        # holds the queue. A SECOND PrintTrajectoryMonitorView, not a new widget
+        # and not WellPreviewWidget: this one already consumes exactly what
+        # _refresh_planned_path computes (zero-ref µm segments + a well-boundary
+        # circle + the needle size), so no second copy of the well-centre →
+        # zero-ref conversion has to exist. That conversion lives in
+        # _well_center_zero_ref_mm, which handles calibrated-vs-geometric and
+        # plate_axis_sign(); a copy would get the sign wrong exactly once, on
+        # hardware. WellPreviewWidget would also add a second coordinate
+        # convention (well-relative mm, Y UP) to one page.
+        self._setup_preview = PrintTrajectoryMonitorView()
+        # Per-INSTANCE minimum: the class default is shared with the Run zone's
+        # monitor, so lowering it there would shrink that one too. This view
+        # auto-fits, so it degrades gracefully to any size.
+        self._setup_preview.setMinimumSize(s(180), s(140))
+        if self._controller is not None and hasattr(
+                self._controller, "plate_flip_180"):
+            self._setup_preview.set_plate_flip_180(
+                self._controller.plate_flip_180())
+        preview_card = Card("Print preview — the ACTIVE print", flush=True,
+                            compact=True)
+        preview_card.add_widget(self._setup_preview)
+        preview_card.add_layout(self._build_apply_row())
+
         # Where it prints — selection belongs with the rest of setup.
         self._navigator = WellPlateNavigator()
         # v7.7: the widget's default tooltip says "click to fast-travel", which
         # is true on the Jog page but not here — a click only SELECTS the well
         # the object will print in; nothing moves until Print.
         self._navigator.setToolTip(
-            "Click a well to choose where the object prints. This does not move "
-            "the stage.")
+            "Click a well to choose where the object prints, or to edit the "
+            "print already queued there. Drag across wells (or Ctrl-click) to "
+            "select several, then use “Apply print to wells”. This does not "
+            "move the stage.")
+        self._navigator.set_multi_select_enabled(True)
         self._navigator.well_clicked.connect(self._on_well_clicked)
-        nav_card = Card("Well — click to place the object", flush=True,
-                        compact=True)
+        self._navigator.selection_changed.connect(
+            self._on_well_selection_changed)
+        nav_card = Card("Plate queue — click to edit · drag to select",
+                        flush=True, compact=True)
         nav_card.add_widget(self._navigator)
+        nav_card.add_widget(self._build_plate_legend())
+
+        right = QSplitter(Qt.Vertical)
+        right.setChildrenCollapsible(False)
+        right.addWidget(preview_card)
+        right.addWidget(nav_card)
+        # 2:3 in favour of the plate: the plate must stay CLICKABLE (a 384-well
+        # plate is already at WellPlateNavigator's radius floor), while the
+        # preview auto-fits whatever it is given.
+        right.setStretchFactor(0, 2)
+        right.setStretchFactor(1, 3)
+        right.setSizes([s(300), s(430)])
+        self._setup_right_split = right
 
         split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
         split.addWidget(scroll)
-        split.addWidget(nav_card)
+        split.addWidget(right)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([s(520), s(420)])
         return split
+
+    def _build_apply_row(self) -> QHBoxLayout:
+        """The queue count + "Apply print to wells", right-aligned under the
+        preview.
+
+        A footer ROW, not a floating overlay child: the monitor view paints its
+        prediction caption along the bottom — the very text an operator needs
+        before stamping a print into forty wells — and an overlay child would
+        occlude it, would need a subclass or an event filter to hook
+        ``resizeEvent``, and contributes nothing to ``sizeHint`` so it would clip
+        on a narrow pane instead of the layout yielding.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(s(10), s(4), s(10), s(6))
+        row.setSpacing(s(8))
+        self._queue_count_lbl = QLabel("")
+        self._queue_count_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        row.addWidget(self._queue_count_lbl)
+        row.addStretch(1)
+        self._apply_btn = QPushButton("Apply print to wells")
+        self._apply_btn.setCursor(Qt.PointingHandCursor)
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._on_apply_print_to_wells)
+        row.addWidget(self._apply_btn)
+        return row
+
+    def _build_plate_legend(self) -> QWidget:
+        """Four colours is three too many to learn by experiment."""
+        lbl = QLabel(
+            "<span style='color:#94e2d5'>●</span> queued &nbsp;"
+            "<span style='color:#cba6f7'>◯</span> selected &nbsp;"
+            "<span style='color:#89b4fa'>◉</span> editing &nbsp;"
+            "<span style='color:#f38ba8'>●</span> can't run")
+        lbl.setStyleSheet(f"font-size: {sf(8)}pt; padding: 0 {s(10)}px "
+                          f"{s(4)}px {s(10)}px;")
+        return lbl
 
     def _build_run_zone(self) -> QWidget:
         holder = QWidget()
@@ -1119,9 +1575,27 @@ class QuickPrintWorkflowPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(s(10))
 
+        # v7.19: NOT renamed — `_print_btn` is in the attribute contract every
+        # partial-page suite reads. Only its tooltip gains the "active print"
+        # wording (see _update_button_state), beside the new Run-all.
         self._print_btn = QPushButton("Print")
         self._print_btn.clicked.connect(self._on_print)
         row.addWidget(self._print_btn)
+
+        # v7.19: run the whole queue. Lives HERE, outside the zone stack, so it
+        # is reachable from the Run zone — which is where the operator is when
+        # they want to know whether to keep going.
+        self._run_all_btn = QPushButton("Run all queued")
+        self._run_all_btn.setEnabled(False)
+        self._run_all_btn.clicked.connect(self._on_run_all)
+        row.addWidget(self._run_all_btn)
+
+        # v7.19: park the batch at a well boundary. The needle retracts to safe Z
+        # and the run holds nothing, so the operator can go image the plate.
+        self._hold_btn = QPushButton("Hold after well")
+        self._hold_btn.setEnabled(False)
+        self._hold_btn.clicked.connect(self._on_hold_clicked)
+        row.addWidget(self._hold_btn)
 
         # v7.7: PrintManager.pause()/resume() existed but were unreachable.
         self._pause_btn = QPushButton("Pause")
@@ -1192,6 +1666,146 @@ class QuickPrintWorkflowPage(QWidget):
             self._context_widget.on_status_update()
         self._push_live_position()
         self._update_button_state()
+
+    # ── v7.20 embedding API (public) ──────────────────────────────
+    # For a host that mounts this page inside its own shell (the Print
+    # Calibrator). Read accessors are thin wrappers over the existing privates —
+    # no logic is moved out, so there is still exactly one implementation of
+    # each fact. Deliberately NOT proxied: plate / well_positions / safe_z /
+    # z_references / hw_config / CommonPrintSettings. The host receives all of
+    # those from the SAME WorkflowsModePage fan-out, so proxying them would
+    # create a second path to one fact.
+
+    def set_external_object(self, obj_dict: dict | None, *,
+                            label: str = "External object",
+                            lock: bool = True) -> None:
+        """Use a single host-supplied object dict as the selected object.
+
+        Thin wrapper over :meth:`set_external_objects` — see it for the details.
+        """
+        self.set_external_objects(
+            [obj_dict] if obj_dict else None, label=label, lock=lock)
+
+    def set_external_objects(self, obj_dicts, *,
+                             label: str = "External object",
+                             lock: bool = True) -> None:
+        """Use a host-supplied LIST of object dicts as the selected object.
+
+        Each entry is the canonical GeometryEngine shape
+        ``{"object_type": …, "params": {…}, "source": "parametric"}`` and runs
+        through the same ``PrintObject.from_dict`` +
+        ``generate_object_trajectory`` pipeline as a saved print — no new
+        geometry path exists.
+
+        A LIST rather than one dict because the objects become SEPARATE print
+        segments, exactly as a multi-object saved print does, so
+        ``build_well_plate_job`` inserts a lift → hop → lower → re-prime between
+        them instead of extruding across the gap. (The Print Calibrator's second
+        line exists precisely to measure that hop.)
+
+        ``None``/empty clears it and re-enables the combo. ``lock=True`` disables
+        the object combo (a calibration run must print the host's object) —
+        disabled-and-visible rather than hidden, so the operator can still SEE
+        what will print. ``label`` reaches the job name, the confirm dialog and
+        the exec log via ``_object_label``, so put the geometry in it.
+        """
+        items = [copy.deepcopy(d) for d in (obj_dicts or []) if d]
+        self._external_objs = items
+        self._external_label = str(label or "External object")
+        self._external_lock = bool(lock) and bool(items)
+        self._object_combo.setToolTip(
+            "The object is set by the hosting page and cannot be changed here."
+            if self._external_lock else "")
+        # _refresh_objects re-adds + re-selects the entry, re-asserts the lock
+        # and tails into _on_object_changed (geometry + readiness + buttons).
+        self._refresh_objects()
+
+    def external_object(self) -> dict | None:
+        """The FIRST host-supplied object, or None. Back-compat accessor."""
+        objs = self.external_objects()
+        return objs[0] if objs else None
+
+    def external_objects(self) -> list:
+        return [copy.deepcopy(d) for d in self._external_objs]
+
+    def set_prime_override_s(self, value: float | None) -> None:
+        """Force the pre-flow prime (s) for the next run, or ``None`` to use the
+        settings popout again.
+
+        While set, :meth:`_preflow_s` returns this regardless of the popout and
+        the popout's own spin is DISABLED — one home for the fact, so the
+        operator cannot silently defeat a calibration run by editing it.
+        """
+        self._prime_override_s = (
+            None if value is None else max(0.0, float(value)))
+        w = getattr(self, "_preflow", None)
+        if w is not None:
+            try:
+                w.setEnabled(self._prime_override_s is None)
+            except Exception:
+                pass
+        self._refresh_setup_status()
+        self._update_settings_summary()
+        self._refresh_planned_path()
+
+    def prime_override_s(self) -> float | None:
+        return self._prime_override_s
+
+    def set_preflow_s(self, value: float) -> None:
+        """Write the per-run pre-flow spin (what :meth:`_preflow_s` returns when
+        no override is active). The spin is linked to the global
+        ``pump_prime_time_s``, so this is only for the case where the host wants
+        the LOCAL value set too."""
+        w = getattr(self, "_preflow", None)
+        if w is not None:
+            try:
+                w.setValue(max(0.0, float(value)))
+            except Exception:
+                pass
+
+    def prime_default_s(self) -> float:
+        """``HardwareConfig.pump_prime_time_s`` as this page resolves it — the
+        "prime currently configured" figure an Apply dialog must show."""
+        return self._prime_default_s()
+
+    def resolved_print_kinematics(self) -> tuple[float, float, float]:
+        """``(print_speed_mm_s, flow_uL_s, prime_uL)`` as the run will use them."""
+        return self._resolved_print_kinematics()
+
+    def selected_well(self) -> str | None:
+        return self._selected_well
+
+    def well_center_zero_ref_mm(self, well: str | None = None):
+        """Calibrated-then-geometric well centre in ZERO-REF mm (the frame
+        ``build_well_plate_job`` takes), or ``None``."""
+        w = well or self._selected_well
+        return self._well_center_zero_ref_mm(w) if w else None
+
+    def well_radius_um(self, well: str | None = None) -> float:
+        """FULL well radius (µm), 0.0 when unknown. The caller owns any inset
+        margin — there is no shared "usable radius" convention in this repo."""
+        w = well or self._selected_well
+        return self._well_radius_um(w) if w else 0.0
+
+    def pump(self) -> str:
+        return self._pump()
+
+    def last_log_path(self):
+        """The last finished run's JSONL exec log, or ``None``. Valid as soon as
+        :attr:`print_state_changed` fires with a terminal state."""
+        return self._last_log_path
+
+    def is_printing(self) -> bool:
+        return self._is_running()
+
+    def cleanup_running(self) -> bool:
+        """True while the post-print cleanup worker is driving the stage.
+
+        A host must not move the stage — nor trust where it is — until this is
+        False: on a clean completion the cleanup travels to waste → wash → oil,
+        so the live view is no longer showing the print."""
+        t = getattr(self, "_cleanup_thread", None)
+        return t is not None and t.is_alive()
 
     def _push_live_position(self) -> None:
         """Feed the live needle XY (zero-ref µm) into the trajectory monitor —
@@ -1289,6 +1903,11 @@ class QuickPrintWorkflowPage(QWidget):
         if self._context_widget is not None:
             self._context_widget.set_calibration_data(
                 plate, well_positions, safe_z)
+        # v7.19: `set_plate` clears everything keyed by well name (the wells may
+        # have been renamed), and the calibration change can also make a queued
+        # well newly runnable or not — so re-push the queue's glyphs and flags.
+        self._glyph_cache.clear()
+        self._refresh_queue_ui()
         # Service-well + ink-well resolution depends on the calibrated positions.
         self._refresh_setup_status()
         self._refresh_planned_path()
@@ -1322,6 +1941,12 @@ class QuickPrintWorkflowPage(QWidget):
         # userData is a "kind:ref" string — QComboBox.findData matches strings
         # reliably (it does not for tuples). file names may contain ':', so
         # parse with split(":", 1).
+        # v7.20: a host-supplied object goes FIRST and carries a stable token, so
+        # the `findData(prev)` restore below survives every rebuild — and this
+        # method is called from showEvent, i.e. on every tab-in.
+        if self._external_objs:
+            self._object_combo.addItem(
+                self._external_label or "External object", self._EXTERNAL_DATA)
         for key, label in _SIMPLE_SHAPES.items():
             self._object_combo.addItem(label, f"simple:{key}")
         try:
@@ -1340,7 +1965,15 @@ class QuickPrintWorkflowPage(QWidget):
             idx = self._object_combo.findData(prev)
             if idx >= 0:
                 self._object_combo.setCurrentIndex(idx)
+        # v7.20: a host-locked object must also be re-SELECTED, not merely
+        # present: the very first rebuild after set_external_object has no `prev`
+        # to restore, and a rebuild must never silently re-enable the combo.
+        if self._external_objs and self._external_lock:
+            idx = self._object_combo.findData(self._EXTERNAL_DATA)
+            if idx >= 0:
+                self._object_combo.setCurrentIndex(idx)
         self._object_combo.blockSignals(False)
+        self._object_combo.setEnabled(not self._external_lock)
         self._on_object_changed()
 
     @staticmethod
@@ -1366,10 +1999,41 @@ class QuickPrintWorkflowPage(QWidget):
         self._update_button_state()
 
     def _on_well_clicked(self, name: str) -> None:
+        if not name:
+            return
+        # v7.19: flush a pending edit into the OUTGOING well BEFORE the incoming
+        # one overwrites the editors. A 120 ms debounce that has not fired yet
+        # would otherwise land in the wrong entry, or be lost outright.
+        self._flush_write_back()
+
         self._selected_well = name
+        # The navigator's `_current_well` is a RENDER of `_selected_well`: pushed
+        # one way, never read back. Reading it back is how a second home for the
+        # fact appears.
         self._navigator.set_current_well(name)
-        self._status.setText(f"Well {name} selected.")
-        self._refresh_planned_path()
+
+        entry = self._queue_get(name)
+        if entry is not None:
+            # _apply_snapshot alone performs no fan-out, so do it once here.
+            self._applying_snapshot = True
+            widgets = self._snapshot_widgets()
+            for w in widgets:
+                w.blockSignals(True)
+            try:
+                warnings = self._apply_snapshot(entry)
+            finally:
+                for w in widgets:
+                    w.blockSignals(False)
+                self._applying_snapshot = False
+            self._on_object_changed()      # the ONE fan-out
+            self._update_settings_summary()
+            self._status.setText(
+                f"Well {name} — editing its queued print."
+                + (f"  ⚠ {warnings[0]}" if warnings else ""))
+        else:
+            self._refresh_planned_path()
+            self._status.setText(f"Well {name} selected (nothing queued).")
+        self._refresh_apply_button()
         self._update_button_state()
 
     def _on_pump_changed(self, *_):
@@ -1469,6 +2133,41 @@ class QuickPrintWorkflowPage(QWidget):
             return None
         return arr
 
+    # ══ v7.21.5: the sketch's own extrusion, along the path ══════════
+    #
+    # A Print-Builder sketch bakes ``extrusion_profile`` — one extrusion
+    # MODIFIER per trajectory segment (0.0 = travel or a no-extrude shape) —
+    # plus the reference bead width it was measured against. Quick Print used
+    # to discard it and re-derive ONE flow for the whole path from its own
+    # knobs, so a sketch whose shapes declare different line widths printed
+    # them all at the same width. Now the profile rides through to the
+    # executor, and Quick Print's own Extrusion × becomes a TRIM on top of it.
+
+    @staticmethod
+    def _obj_dict_extrusion_modifiers(obj_dict, n_segments: int):
+        """The baked per-segment extrusion modifiers for one object, or None.
+
+        REFUSES a profile whose length does not match the object's own
+        trajectory (``n_segments``): an off-by-one profile would apply a
+        shape's flow to the wrong part of the path — worse than falling back
+        to a single flow, which is merely the previous behaviour.
+        """
+        params = (obj_dict or {}).get("params", {}) or {}
+        raw = params.get("extrusion_profile")
+        if not raw or n_segments <= 0:
+            return None
+        try:
+            vals = [max(0.0, float(v)) for v in raw]
+        except (TypeError, ValueError):
+            logger.warning("extrusion_profile is not numeric — ignoring it")
+            return None
+        if len(vals) != n_segments:
+            logger.warning(
+                "extrusion_profile has %d entries for %d segments — ignoring "
+                "it and using a single flow", len(vals), n_segments)
+            return None
+        return vals
+
     def _obj_dict_to_path_points(self, obj_dict, needle, syringe_map):
         """Convert one object dict → flat list[(x_mm, y_mm)] (well-relative).
 
@@ -1555,32 +2254,57 @@ class QuickPrintWorkflowPage(QWidget):
         path.
         """
         arr = self._obj_dict_to_trajectory(obj_dict, needle, syringe_map)
-        return self._subpaths_from_array(arr)
+        n_seg = (arr.shape[0] - 1) if arr is not None and len(arr) else 0
+        return self._subpaths_from_array(
+            arr, self._obj_dict_extrusion_modifiers(obj_dict, n_seg))
 
-    def _subpaths_from_array(self, arr):
+    def _subpaths_from_array(self, arr, modifiers=None):
         """Split an Nx7 trajectory into print sub-paths ``[[(x,y)…], …]`` at its
         internal travel moves (shared by the object path and the per-ink-group
-        multi-ink path). A path with no travel info yields one sub-path."""
+        multi-ink path). A path with no travel info yields one sub-path.
+
+        v7.21.5: when ``modifiers`` (one extrusion modifier per trajectory
+        SEGMENT) is given, it is sliced in LOCKSTEP with the same split and
+        recorded on :attr:`_last_subpath_modifiers` — one list per returned
+        sub-path, each with ``len(sub) - 1`` entries. Kept as a side channel
+        rather than a changed return type because ``_path_segments_for_selection``
+        has a dozen callers that want plain XY.
+        """
+        self._last_subpath_modifiers = []
         if arr is None:
             return []
         pts = [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
+        mods = list(modifiers) if modifiers is not None else None
+        if mods is not None and len(mods) != max(0, len(pts) - 1):
+            mods = None                     # refuse a mismatched profile
         mask = self._travel_mask(arr)
         if mask is None:
-            return [pts] if len(pts) >= 2 else []
+            if len(pts) < 2:
+                return []
+            self._last_subpath_modifiers = [list(mods)] if mods is not None else [None]
+            return [pts]
 
         subpaths: list[list[tuple[float, float]]] = []
+        sub_mods: list = []
         cur: list[tuple[float, float]] = [pts[0]]
+        cur_mods: list[float] = []
         for i in range(len(pts) - 1):
             if bool(mask[i]):
                 # Segment i→i+1 is travel: close the current print run and
                 # restart at the travel destination (drop the travel hop).
                 if len(cur) >= 2:
                     subpaths.append(cur)
+                    sub_mods.append(cur_mods if mods is not None else None)
                 cur = [pts[i + 1]]
+                cur_mods = []
             else:
                 cur.append(pts[i + 1])
+                if mods is not None:
+                    cur_mods.append(mods[i])
         if len(cur) >= 2:
             subpaths.append(cur)
+            sub_mods.append(cur_mods if mods is not None else None)
+        self._last_subpath_modifiers = sub_mods
         return subpaths
 
     def _path_segments_for_selection(self) -> list[list[tuple[float, float]]]:
@@ -1600,7 +2324,22 @@ class QuickPrintWorkflowPage(QWidget):
         kind, ref = data
         needle, syringe_map = self._needle_and_syringe()
 
-        if kind == "simple":
+        if kind == "external":
+            # v7.20: host-supplied object dicts. Deep-copied because
+            # `PrintObject.from_dict` pops "trajectory" off the dict it is given,
+            # and they then run the SAME generate_object_trajectory pipeline as a
+            # saved print — no new geometry path exists. Each becomes its own
+            # segment below, exactly as a multi-object saved print does.
+            obj_dicts = []
+            for i, od in enumerate(self._external_objs):
+                od = copy.deepcopy(od)
+                if not od:
+                    continue
+                od.setdefault("name", f"External{i + 1}")
+                obj_dicts.append(od)
+            if not obj_dicts:
+                return []
+        elif kind == "simple":
             obj_dicts = [self._simple_shape_dict(ref)]
         else:  # saved print file (ref = display name)
             pf = self._print_mgr.load(ref)
@@ -1614,11 +2353,63 @@ class QuickPrintWorkflowPage(QWidget):
                     obj_dicts.append(od)
 
         segments: list[list[tuple[float, float]]] = []
+        profiles: list = []
         for od in obj_dicts:
-            for sub in self._obj_dict_to_subpaths(od, needle, syringe_map):
+            subs = self._obj_dict_to_subpaths(od, needle, syringe_map)
+            mods = list(getattr(self, "_last_subpath_modifiers", []) or [])
+            for k, sub in enumerate(subs):
                 if sub and len(sub) >= 2:
                     segments.append(sub)
+                    profiles.append(mods[k] if k < len(mods) else None)
+        # v7.21.5: kept beside the segments (same order, same length) so the job
+        # builder can hand each PRINT_PATH its own deposition without changing
+        # this method's return type — a dozen callers want plain XY.
+        self._last_segment_modifiers = profiles
         return segments
+
+    def _segments_and_modifiers_for_selection(self):
+        """``(segments, modifier_profiles)`` for the selected object.
+
+        ``modifier_profiles[k]`` is either None (no baked profile — use one
+        flow) or a list of ``len(segments[k]) - 1`` extrusion modifiers.
+        """
+        segs = self._path_segments_for_selection()
+        mods = list(getattr(self, "_last_segment_modifiers", []) or [])
+        while len(mods) < len(segs):
+            mods.append(None)
+        return segs, mods[:len(segs)]
+
+    def _vol_per_mm_profiles(self, modifier_profiles):
+        """Convert per-segment MODIFIERS → µL/mm, against the needle fitted NOW.
+
+        Recomputing from the modifier (rather than replaying the sketch's own
+        µL/mm) prints the DECLARED WIDTHS with the current needle instead of
+        reproducing a volume that was only right for the needle present at bake
+        time. Quick Print's own Extrusion × rides on top as a trim, so the
+        operator keeps one knob over a sketch's numbers. Returns a list the same
+        length as the input, with None where there was no profile.
+        """
+        from SupportClasses.ExtrusionProfile import modifier_to_vol_per_mm
+        area = self._needle_cross_section_mm2()
+        trim = self._extrusion_modifier()
+        out = []
+        for mods in modifier_profiles or []:
+            if not mods or area <= 0:
+                out.append(None)
+            else:
+                out.append(modifier_to_vol_per_mm(mods, area, trim))
+        return out
+
+    def _extrusion_profile_summary(self):
+        """``(has_profile, min_mod, max_mod)`` over the PRINTING segments of the
+        selected object — what the setup status reports and what bounds the
+        flow ceiling. Zeros are skipped: a travel/no-extrude segment is an
+        absence of deposition, not a thin bead."""
+        _segs, mods = self._segments_and_modifiers_for_selection()
+        vals = [v for prof in mods if prof for v in prof if v > 0.0]
+        if not vals:
+            return False, 0.0, 0.0
+        return True, min(vals), max(vals)
 
     def _path_points_for_selection(self) -> list[tuple[float, float]]:
         """Flattened path (all objects concatenated) — kept for geometry
@@ -1628,6 +2419,483 @@ class QuickPrintWorkflowPage(QWidget):
         for seg in self._path_segments_for_selection():
             points.extend(seg)
         return points
+
+    # ══ v7.19: the plate-wide print queue ═══════════════════════════
+    #
+    # Widgets whose values a snapshot captures, IN WRITE ORDER. Object first: it
+    # re-derives the size row's visibility, the sketch detection and the ink-map
+    # rows. Pump before ink: changing the pump re-defaults the ink combo.
+    _SNAPSHOT_WIDGETS = (
+        "_object_combo", "_size_spin", "_pump_combo", "_ink_combo",
+        "_ink_z_spin", "_ink_padding_spin", "_top_speed_spin",
+        "_resolution_spin", "_printz_spin", "_extrusion_mod_spin",
+        "_motion_mode_combo",
+    )
+    #: Stamping into at least this many wells at once asks first.
+    _APPLY_CONFIRM_N = 24
+
+    def _snapshot_widgets(self) -> list:
+        return [w for w in (getattr(self, n, None)
+                            for n in self._SNAPSHOT_WIDGETS) if w is not None]
+
+    def _snapshot_from_widgets(self, well: str = "") -> QueuedPrint:
+        """Capture what is on screen as a QueuedPrint.
+
+        Reads the widgets, so GUI-thread only. Heights are captured in the SPIN's
+        own frame (above plate bottom), never resolved to zero-ref — see
+        ``SupportClasses.PrintQueue``'s rule 1.
+        """
+        def _val(name, default):
+            w = getattr(self, name, None)
+            try:
+                return w.value()
+            except Exception:
+                return default
+
+        ink_map_by_name: dict[str, str] = {}
+        sk = self._loaded_sketch
+        if sk is not None:
+            for iid, mapped in (self._ink_map or {}).items():
+                try:
+                    ink = sk.ink_by_id(int(iid))
+                except Exception:
+                    ink = None
+                name = getattr(ink, "name", None)
+                if name and mapped:
+                    ink_map_by_name[str(name)] = str(mapped)
+        return QueuedPrint(
+            well=well or (self._selected_well or ""),
+            object_data=str(self._object_combo.currentData() or ""),
+            object_label=self._object_label(),
+            size_mm=float(_val("_size_spin", 1.0)),
+            pump=self._pump(),
+            ink_name=self._selected_ink() or "",
+            ink_dip_z_mm=float(_val("_ink_z_spin", 0.5)),
+            ink_padding_uL=float(_val("_ink_padding_spin", 0.0)),
+            top_speed_mm_s=float(_val("_top_speed_spin", 2.5)),
+            resolution_um=float(_val("_resolution_spin", 30.0)),
+            print_z_mm=float(_val("_printz_spin", 0.2)),
+            extrusion_mod=float(_val("_extrusion_mod_spin", 1.0)),
+            motion_mode=self._motion_mode(),
+            ink_map_by_name=ink_map_by_name,
+        )
+
+    @staticmethod
+    def _set_combo_data(combo, data) -> bool:
+        """Select the item whose userData == *data*.
+
+        Returns False and leaves the combo ALONE when the value is absent (e.g. a
+        saved print deleted off disk). It must never be coerced to index 0 —
+        that is how merely OPENING a queue entry would silently EDIT it.
+        """
+        if combo is None:
+            return False
+        idx = combo.findData(data)
+        if idx < 0:
+            return False
+        combo.setCurrentIndex(idx)
+        return True
+
+    @staticmethod
+    def _set_combo_text(combo, text) -> bool:
+        if combo is None or not text:
+            return False
+        idx = combo.findText(str(text))
+        if idx < 0:
+            return False
+        combo.setCurrentIndex(idx)
+        return True
+
+    def _apply_snapshot(self, qp: QueuedPrint) -> list[str]:
+        """Drive the config widgets to *qp*. Returns disclosure warnings.
+
+        Signals are expected to be blocked by the caller; this performs NO
+        fan-out of its own, so the caller decides when the one refresh happens.
+
+        ⚠ Two things that do NOT follow from setting the widgets, because the
+        blocked signals mean ``_on_object_changed`` never runs:
+          * ``_loaded_sketch`` — set explicitly, or ``_is_multi_ink()`` /
+            ``_ink_groups()`` would read the PREVIOUS object's sketch.
+          * the ink mapping — seeded into ``_ink_map_last`` (name-keyed) and NOT
+            into ``_ink_map``, because ``_rebuild_ink_mapping_ui`` hard-resets
+            ``_ink_map`` and re-derives it from ``_ink_map_last``; assigning
+            ``_ink_map`` here would be wiped by the very refresh that follows.
+
+        ⚠ ``setValue`` CLAMPS silently, and ``_update_top_speed_cap`` puts a
+        dynamic maximum on the speed spin, so a print queued at 6 mm/s on a
+        machine since measured at 4.2 would quietly run slower. Every numeric set
+        is compared back and a difference is DISCLOSED.
+        """
+        warnings: list[str] = []
+        if qp is None:
+            return warnings
+
+        def _set_num(name, wanted, label, unit=""):
+            w = getattr(self, name, None)
+            if w is None:
+                return
+            try:
+                w.setValue(float(wanted))
+                got = float(w.value())
+            except Exception:
+                return
+            if abs(got - float(wanted)) > 1e-6:
+                warnings.append(
+                    f"{qp.well}: {label} {float(wanted):g}{unit} limited to "
+                    f"{got:g}{unit}")
+
+        if not self._set_combo_data(self._object_combo, qp.object_data):
+            warnings.append(
+                f"{qp.well}: “{qp.object_label or qp.object_data}” is no longer "
+                "in the print library")
+        _set_num("_size_spin", qp.size_mm, "size", " mm")
+        self._set_combo_text(self._pump_combo, qp.pump)
+        self._set_combo_data(self._ink_combo, qp.ink_name)
+        _set_num("_ink_z_spin", qp.ink_dip_z_mm, "ink dip Z", " mm")
+        _set_num("_ink_padding_spin", qp.ink_padding_uL, "ink padding", " µL")
+        _set_num("_top_speed_spin", qp.top_speed_mm_s, "top speed", " mm/s")
+        _set_num("_resolution_spin", qp.resolution_um, "resolution", " µm")
+        _set_num("_printz_spin", qp.print_z_mm, "print height", " mm")
+        _set_num("_extrusion_mod_spin", qp.extrusion_mod, "extrusion ×")
+        self._set_combo_data(self._motion_mode_combo, qp.motion_mode)
+        # The two derived caches the blocked signals did not refresh.
+        try:
+            self._loaded_sketch = self._load_selected_sketch()
+        except Exception:
+            self._loaded_sketch = None
+        if qp.ink_map_by_name:
+            self._ink_map_last.update(
+                {str(k): str(v) for k, v in qp.ink_map_by_name.items() if v})
+        return warnings
+
+    @contextlib.contextmanager
+    def _snapshot_applied(self, qp: QueuedPrint):
+        """Transiently drive the config widgets to *qp*, then restore.
+
+        GUI-THREAD ONLY, and **nothing inside may re-enter the Qt event loop** —
+        no modal dialog, no ``processEvents``. The app's ~300 ms status tick would
+        otherwise run ``_refresh_setup_status`` / ``_refresh_planned_path``
+        against the TRANSIENT widget values and repaint from the wrong snapshot.
+        (This is why the print-floor check inside the resolve pass is numeric and
+        its one dialog is shown after everything has been restored.)
+
+        Restoration IS an apply of the snapshot captured on the way in, so the
+        save-list and the restore-list are the same list by construction and
+        cannot drift apart as fields are added.
+        """
+        active = self._snapshot_from_widgets()
+        prev_sketch = self._loaded_sketch
+        prev_ink_map = dict(self._ink_map)
+        widgets = self._snapshot_widgets()
+        prev_applying = self._applying_snapshot
+        self._applying_snapshot = True
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            yield self._apply_snapshot(qp)
+        finally:
+            try:
+                self._apply_snapshot(active)
+            except Exception:
+                logger.exception("restoring the active print config failed")
+            finally:
+                self._loaded_sketch = prev_sketch
+                self._ink_map = prev_ink_map
+                for w in widgets:
+                    w.blockSignals(False)
+                self._applying_snapshot = prev_applying
+
+    # ── queue mutation ────────────────────────────────────────────
+
+    def _queue_get(self, well: str):
+        return _pq.get(self._queue, well)
+
+    def _write_back(self) -> None:
+        """Mirror the editors into the ACTIVE well's queue entry.
+
+        WRITE-ONLY: never calls a widget setter and never calls
+        ``_apply_snapshot``. That single rule is what makes the
+        edit → write-back → refresh → edit cycle impossible.
+
+        No-ops while a snapshot is being applied, with no active well, or when the
+        active well has no entry — editing an un-queued active well is COMPOSING a
+        new print, which becomes an entry only when Apply says so.
+        """
+        if self._applying_snapshot:
+            return
+        well = self._selected_well
+        if not well or self._queue_get(well) is None:
+            return
+        try:
+            self._queue = _pq.upsert(self._queue,
+                                     self._snapshot_from_widgets(well))
+        except Exception:
+            logger.exception("queue write-back failed")
+            return
+        self._refresh_queue_ui()
+
+    def _queue_writeback_soon(self) -> None:
+        t = getattr(self, "_writeback_timer", None)
+        if t is not None and not self._applying_snapshot:
+            t.start()
+
+    def _flush_write_back(self) -> None:
+        """Force a pending debounced write-back to land NOW.
+
+        Called before the active well changes: a 120 ms debounce that has not
+        fired yet would otherwise land in the WRONG entry, or be lost outright.
+        """
+        t = getattr(self, "_writeback_timer", None)
+        if t is not None:
+            t.stop()
+        self._write_back()
+
+    def _on_apply_print_to_wells(self) -> None:
+        wells = self._navigator.selected_wells()
+        if not wells:
+            self._status.setText("Select one or more wells on the plate first.")
+            return
+        if not self._object_combo.currentData():
+            self._status.setText("Choose an object first.")
+            return
+        overwriting = [w for w in wells if self._queue_get(w) is not None]
+        if len(wells) >= self._APPLY_CONFIRM_N or overwriting:
+            lines = [f"Apply this print to {len(wells)} well"
+                     f"{'' if len(wells) == 1 else 's'}?"]
+            if overwriting:
+                lines.append(
+                    f"{len(overwriting)} of them already hold a queued print, "
+                    "which will be REPLACED "
+                    f"({', '.join(overwriting[:6])}"
+                    f"{' …' if len(overwriting) > 6 else ''}).")
+            if QMessageBox.question(
+                    self, "Apply print to wells", "\n\n".join(lines),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                self._status.setText("Cancelled.")
+                return
+        snap = self._snapshot_from_widgets()
+        for w in wells:
+            # A COPY per well. One shared object would make editing A17 edit all
+            # forty, which is exactly what "each print is an independent
+            # activity" rules out.
+            entry = snap.copy()
+            entry.well = w
+            self._queue = _pq.upsert(self._queue, entry)
+        if self._selected_well is None:
+            # Otherwise the preview above the plate would stay blank.
+            self._selected_well = wells[0]
+            self._navigator.set_current_well(wells[0])
+            self._refresh_planned_path()
+        self._refresh_queue_ui()
+        self._refresh_setup_status()
+        self._update_button_state()
+        self._status.setText(
+            f"Applied “{self._object_label()}” to {len(wells)} well"
+            f"{'' if len(wells) == 1 else 's'}.")
+
+    def _on_queue_remove(self) -> None:
+        wells = [w for w in self._navigator.selected_wells()
+                 if self._queue_get(w) is not None]
+        if not wells and self._selected_well:
+            # Falling back to the active well spares an operator who clicked one
+            # well and wants it gone from having to go re-select it.
+            if self._queue_get(self._selected_well) is not None:
+                wells = [self._selected_well]
+        if not wells:
+            self._status.setText("No queued wells selected.")
+            return
+        for w in wells:
+            self._queue = _pq.remove(self._queue, w)
+        self._refresh_queue_ui()
+        self._refresh_setup_status()
+        self._update_button_state()
+        self._status.setText(f"Removed {len(wells)} queued print"
+                             f"{'' if len(wells) == 1 else 's'}.")
+
+    def _on_queue_clear(self) -> None:
+        if not self._queue:
+            return
+        if QMessageBox.question(
+                self, "Clear the queue",
+                f"Remove all {len(self._queue)} queued prints?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._queue = []
+        self._refresh_queue_ui()
+        self._refresh_setup_status()
+        self._update_button_state()
+        self._status.setText("Queue cleared.")
+
+    def _on_well_selection_changed(self, wells) -> None:
+        self._refresh_apply_button()
+
+    # ── queue → UI ────────────────────────────────────────────────
+
+    def _queue_group_by_ink(self) -> bool:
+        w = getattr(self, "_group_by_ink_check", None)
+        try:
+            return bool(w.isChecked())
+        except Exception:
+            return False
+
+    def _queue_clean_between(self) -> bool:
+        w = getattr(self, "_clean_between_check", None)
+        try:
+            return bool(w.isChecked())
+        except Exception:
+            return False
+
+    def _plate_index(self):
+        names = getattr(self._plate, "well_names", None) if self._plate else None
+        return plate_index_from_names(names or [])
+
+    def _ordered_queue(self) -> list:
+        return order_queue(
+            self._queue,
+            ORDER_INK if self._queue_group_by_ink() else ORDER_PLATE,
+            self._plate_index())
+
+    def _queue_entry_problem(self, qp: QueuedPrint) -> str:
+        """A short, operator-facing reason this entry cannot run, or "".
+
+        Cheap checks only — the authoritative per-unit gating happens in
+        :meth:`_resolve_queue`. This drives the plate flag and the list row, so it
+        must not build geometry.
+        """
+        if not qp.object_data:
+            return "no object"
+        if self._object_combo.findData(qp.object_data) < 0:
+            return "print no longer in the library"
+        kind_ref = self._parse_obj_data(qp.object_data)
+        if kind_ref and kind_ref[0] == "file":
+            try:
+                if self._print_mgr.load(kind_ref[1]) is None:
+                    return "print file missing"
+            except Exception:
+                return "print file unreadable"
+        wells = self._well_positions or {}
+        if self._plate is not None and qp.well not in (
+                getattr(self._plate, "well_names", None) or []):
+            return "not a well on this plate"
+        if wells and qp.well not in wells:
+            return "well not calibrated"
+        return ""
+
+    def _refresh_queue_ui(self) -> None:
+        """One entry point for everything the queue drives: the plate glyphs, the
+        list readout, the counts and the buttons."""
+        if not hasattr(self, "_queue_list"):
+            return
+        problems = {qp.well: self._queue_entry_problem(qp)
+                    for qp in self._queue}
+        self._refresh_queue_overlay(problems)
+        self._queue_list.clear()
+        for qp in self._ordered_queue():
+            why = problems.get(qp.well, "")
+            text = qp.label() + (f"   ⚠ {why}" if why else "")
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, qp.well)
+            if why:
+                item.setForeground(QColor(COLORS["red"]))
+            self._queue_list.addItem(item)
+        n = len(self._queue)
+        card = getattr(self, "_queue_card", None)
+        if card is not None and hasattr(card, "set_title"):
+            card.set_title(f"Queue — {n} print{'' if n == 1 else 's'}")
+        self._refresh_apply_button()
+        for name in ("_queue_remove_btn", "_queue_clear_btn",
+                     "_queue_select_btn"):
+            b = getattr(self, name, None)
+            if b is not None:
+                b.setEnabled(n > 0)
+        self._update_button_state()
+
+    def _refresh_apply_button(self) -> None:
+        btn = getattr(self, "_apply_btn", None)
+        if btn is None:
+            return
+        wells = self._navigator.selected_wells() if hasattr(
+            self, "_navigator") else []
+        n = len(wells)
+        has_obj = bool(self._object_combo.currentData())
+        # NOT gated on readiness: laying out a plate with the stage disconnected
+        # or busy is the whole point of a queue.
+        btn.setEnabled(self._plate is not None and has_obj and n >= 1)
+        if self._plate is None:
+            btn.setToolTip("No plate loaded — run Calibration first.")
+        elif not has_obj:
+            btn.setToolTip("Choose an object first.")
+        elif n == 0:
+            btn.setToolTip(
+                "Select one or more wells on the plate below — click, or drag "
+                "across wells — then apply this print to them.")
+        else:
+            shown = ", ".join(wells[:6]) + (" …" if n > 6 else "")
+            btn.setToolTip(
+                f"Stamp this print and its parameters into the {n} selected "
+                f"well{'' if n == 1 else 's'} ({shown}). Any print already "
+                "queued in those wells is REPLACED.")
+        lbl = getattr(self, "_queue_count_lbl", None)
+        if lbl is not None:
+            lbl.setText(f"{len(self._queue)} queued · {n} selected")
+
+    def _glyph_paths_for(self, qp: QueuedPrint):
+        """Well-relative polylines to draw inside *qp*'s well, decimated.
+
+        Cached by CONFIG identity (object + size + resolution), not by well: a
+        real queue is usually "the same print in forty wells", so this normally
+        holds one entry. Without it, a 384-well plate would rebuild hundreds of
+        trajectories on every debounced edit.
+        """
+        key = (qp.object_data, round(float(qp.size_mm), 4),
+               round(float(qp.resolution_um), 3))
+        hit = self._glyph_cache.get(key)
+        if hit is not None:
+            return hit
+        paths: list = []
+        try:
+            with self._snapshot_applied(qp):
+                for seg in self._path_segments_for_selection():
+                    if not seg or len(seg) < 2:
+                        continue
+                    # DISPLAY-ONLY decimation. A meander at 30 µm resolution is
+                    # thousands of points rendered into a ~12 px circle; the
+                    # EXECUTOR always uses the full geometry.
+                    step = max(1, len(seg) // 64)
+                    thin = list(seg[::step])
+                    if thin[-1] != seg[-1]:
+                        thin.append(seg[-1])       # keep the endpoint
+                    paths.append(thin)
+        except Exception as exc:
+            logger.debug("glyph geometry failed for %s: %s", qp.well, exc)
+            paths = []
+        if len(self._glyph_cache) > 32:
+            self._glyph_cache.clear()
+        self._glyph_cache[key] = paths
+        return paths
+
+    def _refresh_queue_overlay(self, problems: dict | None = None) -> None:
+        """Push the queue into the plate as per-well toolpath glyphs."""
+        nav = getattr(self, "_navigator", None)
+        if nav is None or not hasattr(nav, "set_well_paths"):
+            return
+        if not self._queue:
+            nav.set_well_paths(None)
+            return
+        if problems is None:
+            problems = {qp.well: self._queue_entry_problem(qp)
+                        for qp in self._queue}
+        overlays: dict[str, tuple] = {}
+        for qp in self._queue:
+            ok = not problems.get(qp.well)
+            overlays[qp.well] = (self._glyph_paths_for(qp) if ok else [],
+                                 None, ok)
+        nav.set_well_paths(overlays)
 
     # ── Planned-path preview (zero-ref µm) ─────────────────────────
 
@@ -1650,21 +2918,43 @@ class QuickPrintWorkflowPage(QWidget):
             pass
         return 0.0
 
+    def _plan_views(self) -> list:
+        """Every view that renders the PLAN.
+
+        ``_traj_view`` first — it is the name the attribute contract pins. Returns
+        [] on a partially-built page, so callers need no hasattr guard.
+
+        NOTE the deliberate omission: the LIVE surfaces (``set_position`` /
+        ``set_recording`` / ``reset_live``) are NOT routed through here. During a
+        queue run the Setup preview shows the ACTIVE print, which may not be the
+        well currently printing, so a needle dot there would be false rather than
+        merely noisy — and the Run zone is where "what is happening now" belongs.
+        """
+        out = []
+        for name in ("_traj_view", "_setup_preview"):
+            v = getattr(self, name, None)
+            if v is not None:
+                out.append(v)
+        return out
+
     def _refresh_planned_path(self) -> None:
         """Recompute the planned toolpath for the selected well + object and
-        push it (in zero-ref µm) into the trajectory monitor. Resets the live
-        overlay so a previous run's trace doesn't linger on a new plan."""
-        if not hasattr(self, "_traj_view"):
+        push it (in zero-ref µm) into every plan view. Resets the live overlay so
+        a previous run's trace doesn't linger on a new plan."""
+        views = self._plan_views()
+        if not views:
             return
         well = self._selected_well
         if not well or not self._object_combo.currentData():
-            self._traj_view.set_planned_path(None)
-            self._traj_view.set_well_boundary(None, 0.0)
+            for v in views:
+                v.set_planned_path(None)
+                v.set_well_boundary(None, 0.0)
             return
         center = self._well_center_zero_ref_mm(well)
         if center is None:
-            self._traj_view.set_planned_path(None)
-            self._traj_view.set_well_boundary(None, 0.0)
+            for v in views:
+                v.set_planned_path(None)
+                v.set_well_boundary(None, 0.0)
             return
         cx_um, cy_um = center[0] * 1000.0, center[1] * 1000.0
         try:
@@ -1676,11 +2966,11 @@ class QuickPrintWorkflowPage(QWidget):
             [(cx_um + px * 1000.0, cy_um + py * 1000.0) for (px, py) in seg]
             for seg in segments if seg
         ]
-        self._traj_view.set_planned_path(seg_um or None)
-
         radius_um = self._well_radius_um(well)
-        self._traj_view.set_well_boundary(
-            (cx_um, cy_um) if radius_um > 0 else None, radius_um)
+        for v in views:
+            v.set_planned_path(seg_um or None)
+            v.set_well_boundary(
+                (cx_um, cy_um) if radius_um > 0 else None, radius_um)
 
         # Size the needle marker from the configured needle's ORIFICE OD — what
         # actually approaches the plate (best-effort).
@@ -1688,10 +2978,12 @@ class QuickPrintWorkflowPage(QWidget):
             needle, _ = self._needle_and_syringe()
             od_um = needle_orifice_od_mm(needle) * 1000.0
             if od_um:
-                self._traj_view.set_needle(float(od_um))
+                for v in views:
+                    v.set_needle(float(od_um))
         except Exception:
             pass
 
+        # Live trace: the Run zone's view ONLY (see _plan_views).
         self._traj_view.reset_live()
         self._kick_prediction(segments, cx_um, cy_um)
 
@@ -1702,7 +2994,10 @@ class QuickPrintWorkflowPage(QWidget):
     def _kick_prediction(self, segments, cx_um, cy_um) -> None:
         self._pred_gen = getattr(self, "_pred_gen", 0) + 1
         gen = self._pred_gen
-        self._traj_view.set_predicted_path(None)
+        # v7.19: clear on EVERY plan view — otherwise the Setup preview keeps the
+        # previous selection's prediction on screen.
+        for v in self._plan_views():
+            v.set_predicted_path(None)
         if self._motion_mode() != "velocity" or not segments:
             return
         try:
@@ -1782,9 +3077,10 @@ class QuickPrintWorkflowPage(QWidget):
             p95 = overlays.pop("_pred_p95_um", None)
         self._pred_overlays = overlays or {}
         self._predicted_p95_um = p95
-        if hasattr(self, "_traj_view"):
-            self._traj_view.set_predicted_path(segments, note,
-                                               predicted_p95_um=p95)
+        views = self._plan_views()
+        if views:
+            for v in views:
+                v.set_predicted_path(segments, note, predicted_p95_um=p95)
             self._apply_overlay_mode()
 
     def _overlay_pill_mode(self) -> str:
@@ -1795,16 +3091,22 @@ class QuickPrintWorkflowPage(QWidget):
         return getattr(btn, "_overlay_key", "none") if btn else "none"
 
     def _apply_overlay_mode(self) -> None:
-        """Push the selected overlay channel (or clear it) into the monitor."""
-        if not hasattr(self, "_traj_view"):
+        """Push the selected overlay channel (or clear it) into every plan view.
+
+        The PILLS stay in the Run zone only: one owner of the chosen channel, two
+        renderers of it.
+        """
+        views = self._plan_views()
+        if not views:
             return
         mode = self._overlay_pill_mode()
         data = (getattr(self, "_pred_overlays", None) or {}).get(mode)
-        if mode == "none" or not data:
-            self._traj_view.set_overlay(None)
-            return
-        self._traj_view.set_overlay(mode, data["values"], data["unit"],
-                                    data.get("vmin"), data.get("vmax"))
+        for v in views:
+            if mode == "none" or not data:
+                v.set_overlay(None)
+            else:
+                v.set_overlay(mode, data["values"], data["unit"],
+                              data.get("vmin"), data.get("vmax"))
 
     # ── Ink selection / override + pickup volume ──────────────────
 
@@ -2048,12 +3350,31 @@ class QuickPrintWorkflowPage(QWidget):
         xy = self._xy_max_mm_s()
         maxflow = self._max_pump_flow_uL_s()
         area = self._needle_cross_section_mm2()
-        mod = self._extrusion_modifier()
+        # v7.21.5: with a per-segment profile the flow is NOT uniform, so the
+        # ceiling has to be sized by the THICKEST segment — the peak is what
+        # would over-pressure the needle (a pulled glass tip shatters), and a
+        # mean would let it through. ``_flow_modifier_peak`` is the trim alone
+        # when there is no profile, so an ordinary print is unchanged.
+        mod = self._flow_modifier_peak()
         if maxflow > 0 and area > 0 and mod > 0:
             xy_flow = maxflow / (area * mod)
             if xy_flow < xy:
                 return xy_flow
         return xy
+
+    def _flow_modifier_peak(self) -> float:
+        """The largest effective extrusion modifier the selected print uses.
+
+        ``Extrusion ×`` (the trim) alone when the object carries no baked
+        profile — so behaviour is unchanged for every non-sketch print — and
+        ``trim × peak(profile)`` when it does. Read from a cache refreshed in
+        :meth:`_refresh_setup_status` (and on every object change), because the
+        flow ceiling is consulted from the status refresh and re-deriving the
+        geometry there would load the print file again on each pass.
+        """
+        trim = self._extrusion_modifier()
+        peak = getattr(self, "_ext_profile_peak", 0.0) or 0.0
+        return trim * peak if peak > 0 else trim
 
     def _auto_flow_100_uL_s(self) -> float:
         """Auto-calculated pump flow at 100% print speed (µL/s).
@@ -2217,6 +3538,29 @@ class QuickPrintWorkflowPage(QWidget):
         except Exception:
             pass
         return warn
+
+    def refresh_speed_limits(self) -> None:
+        """v7.21.2: re-read everything the XY calibration just changed.
+
+        Called by ``MainWindow._refresh_all_speed_limits`` (via
+        ``StageController.notify_speed_limits_changed``) the moment a calibration
+        commits, so Quick Print picks the new tuning up WITHOUT a restart: the
+        top-speed cap re-anchors to the measured maximum and the "stage motion not
+        characterised" warning clears.
+
+        The tuning itself needs no refresh — ``_build_settings`` calls
+        ``stamp_print_settings(settings, get_store())`` on every print, so the next
+        print reads the freshly persisted values straight out of the per-machine
+        store. This method only re-syncs what is DISPLAYED.
+        """
+        try:
+            self._update_top_speed_cap()
+        except Exception as e:
+            logger.debug("quick print top-speed cap refresh failed: %s", e)
+        try:
+            self._refresh_setup_status()
+        except Exception as e:
+            logger.debug("quick print status refresh failed: %s", e)
 
     def _update_top_speed_cap(self) -> None:
         """Cap the top-speed spin at the MEASURED stage maximum (only when a
@@ -2423,6 +3767,16 @@ class QuickPrintWorkflowPage(QWidget):
 
         # ── geometry ──
         segs = _try(self._path_segments_for_selection, []) or []
+        # v7.21.5: refresh the extrusion-profile cache from the SAME geometry
+        # pass (the modifiers are recorded beside the segments), so the flow
+        # ceiling and the status text agree and neither re-reads the print file.
+        try:
+            has_prof, lo_mod, hi_mod = self._extrusion_profile_summary()
+            self._ext_profile_peak = hi_mod if has_prof else 0.0
+            self._ext_profile_span = (lo_mod, hi_mod) if has_prof else None
+        except Exception:
+            self._ext_profile_peak = 0.0
+            self._ext_profile_span = None
         ctx.n_strokes = len(segs) or None
         length = 0.0
         rmax = 0.0
@@ -2449,6 +3803,14 @@ class QuickPrintWorkflowPage(QWidget):
         ctx.bore_id_um = _try(lambda: float(needle.id_um), None) if needle else None
         area = _try(self._needle_cross_section_mm2, 0.0) or 0.0
         mod = _try(self._extrusion_modifier, 1.0) or 1.0
+        span = getattr(self, "_ext_profile_span", None)
+        if span:
+            # The bead is no longer ONE width: report the effective range and
+            # that the × is now a trim, and size the bead readout from the
+            # WIDEST segment (the one that has to fit the flow ceiling).
+            ctx.extrusion_span = (span[0] * mod, span[1] * mod)
+            ctx.extrusion_trim = mod
+            mod = span[1] * mod
         if area > 0:
             # An area-equivalent circular bead: Ø = 2·sqrt(A·mod/π).
             ctx.bead_width_um = 2.0 * ((area * mod / 3.141592653589793) ** 0.5) * 1000.0
@@ -3214,15 +4576,49 @@ class QuickPrintWorkflowPage(QWidget):
             self._ink_map_layout.addWidget(row)
             self._ink_map_combos[iid] = combo
 
+    def _collect_extra_state(self) -> dict:
+        """v7.7/v7.19: page state that is not a registered widget, saved with the
+        profile — the remembered ink mapping and the whole plate-wide queue."""
+        out: dict = {"ink_map_last": dict(self._ink_map_last)}
+        try:
+            out["print_queue"] = queue_to_state(self._queue)
+            out["queue_group_by_ink"] = self._queue_group_by_ink()
+            out["queue_clean_between"] = self._queue_clean_between()
+        except Exception as exc:
+            logger.debug("queue state collect failed: %s", exc)
+        return out
+
     def _restore_extra_state(self, extra: dict) -> None:
         """v7.7: restore the remembered abstract-ink → configured-ink mapping
-        from the loaded profile, then rebuild the rows so they show it."""
+        from the loaded profile, then rebuild the rows so they show it.
+        v7.19: and the plate-wide print queue."""
+        if not isinstance(extra, dict):
+            return
         remembered = extra.get("ink_map_last")
         if isinstance(remembered, dict):
             self._ink_map_last = {str(k): str(v)
                                   for k, v in remembered.items() if v}
             if hasattr(self, "_ink_map_layout"):
                 self._rebuild_ink_mapping_ui()
+        try:
+            # Entries for wells that are not on the CURRENT plate are KEPT, not
+            # dropped: the operator may be loading a 96-well profile with a
+            # 24-well plate mounted, and silently destroying their layout would be
+            # unrecoverable. They are flagged on the plate and refused BY NAME at
+            # run time instead.
+            self._queue = queue_from_state(extra.get("print_queue"))
+        except Exception as exc:
+            logger.debug("queue state apply failed: %s", exc)
+            self._queue = []
+        for key, name in (("queue_group_by_ink", "_group_by_ink_check"),
+                          ("queue_clean_between", "_clean_between_check")):
+            w = getattr(self, name, None)
+            if w is not None and key in extra:
+                w.blockSignals(True)
+                w.setChecked(bool(extra.get(key)))
+                w.blockSignals(False)
+        self._glyph_cache.clear()
+        self._refresh_queue_ui()
 
     def _on_ink_map_changed(self, ink_id: int, name: str, value) -> None:
         if value:
@@ -3305,11 +4701,14 @@ class QuickPrintWorkflowPage(QWidget):
         from SupportClasses.SketchTrajectory import compile_to_trajectory
         needle, syringe_map = self._needle_and_syringe()
         try:
-            arr = compile_to_trajectory(
-                sub, needle, syringe_map.get(pump)).trajectory
+            res = compile_to_trajectory(sub, needle, syringe_map.get(pump))
         except Exception:
             return []
-        return self._subpaths_from_array(arr)
+        # v7.21.5: the sub-sketch is compiled RIGHT HERE, so its per-segment
+        # extrusion is in hand — a multi-ink run gets the same fidelity as a
+        # single-ink one instead of falling back to one flow per group.
+        return self._subpaths_from_array(
+            res.trajectory, res.extrusion_profile or None)
 
     def _pickup_uL_for_length(self, path_len_mm: float) -> float:
         speed, flow, prime = self._resolved_print_kinematics()
@@ -3344,6 +4743,20 @@ class QuickPrintWorkflowPage(QWidget):
                if getattr(self, "_orbit_speed_spin", None) is not None else 2.0)
         return {"prime_uL": prime_uL, "orbit": orbit,
                 "orbit_diameter_mm": dia, "orbit_speed_mm_s": spd}
+
+    def _hold_in_liquid_s(self) -> float:
+        """v7.21.7: the global hold-in-liquid dwell (s) in force, for the
+        confirm dialogs and the settings summary. Read from the SAME place the
+        executor resolves it (the controller, which reads HardwareConfig), so
+        the dialog cannot quote a value the run will not use."""
+        ctrl = getattr(self, "_controller", None)
+        getter = getattr(ctrl, "pump_post_aspirate_dwell_s", None)
+        if not callable(getter):
+            return 0.0
+        try:
+            return max(0.0, float(getter()))
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _segments_length_mm(segments) -> float:
@@ -3414,6 +4827,7 @@ class QuickPrintWorkflowPage(QWidget):
             wn = resolve_pickup_well(wl, self._plate)
             ink_pos = wells.get(wn) if wn else None
             segments = self._group_segments(sub, pump)
+            group_mods = list(getattr(self, "_last_subpath_modifiers", []) or [])
             if not segments or ink_pos is None:
                 continue
             length = self._segments_length_mm(segments)
@@ -3421,6 +4835,7 @@ class QuickPrintWorkflowPage(QWidget):
                 "ink_id": iid, "ink_name": ink_name, "pump": pump,
                 "ink_pos": ink_pos, "ink_dip_z": ink_dip_z,
                 "segments": segments, "well": well, "center": center,
+                "extrusion_profiles": self._vol_per_mm_profiles(group_mods),
                 "settings": self._build_settings(pump=pump),
                 "pickup_uL": self._pickup_uL_for_length(length),
                 # Resolve prime/orbit kwargs on the GUI thread (reads widgets).
@@ -3456,6 +4871,11 @@ class QuickPrintWorkflowPage(QWidget):
                 f"  • Circular pickup ({self._orbit_dia_spin.value():.2f} mm) "
                 + ("for all inks" if self._orbit_all_check.isChecked()
                    else "for granular inks"))
+        hold_s = self._hold_in_liquid_s()
+        if hold_s > 0:
+            lines.append(
+                f"  • Hold the needle in the liquid {hold_s:.1f}s after every "
+                "aspirate before lifting")
         if cleanup:
             lines.append("  • Clean the needle at the end")
         lines += ["", "Hardware set up correctly and ready to start?"]
@@ -3501,7 +4921,7 @@ class QuickPrintWorkflowPage(QWidget):
                     executor.prep_bore = groups[0]["pump"]
                     executor.run_prep()
                 for gi, g in enumerate(groups):
-                    if self._multi_abort_requested:
+                    if self._sequence_abort_requested():
                         raise AbortException()
                     if not getattr(self._controller, "is_zp_connected", False):
                         raise AbortException()
@@ -3546,16 +4966,32 @@ class QuickPrintWorkflowPage(QWidget):
         self._multi_thread.start()
         self._update_button_state()
 
-    def _run_group_job_blocking(self, g: dict) -> None:
-        """Build + start one ink group's discrete print job and BLOCK the
-        worker thread until it reaches a terminal state (off the GUI thread).
-        Raises on abort / error so the worker's finally retracts to safe Z."""
+    def _sequence_abort_requested(self) -> bool:
+        """Sticky abort for EITHER long-running sequence engine.
+
+        v7.19: ``_run_group_job_blocking`` is shared by the multi-ink run and the
+        print queue, and it reads this to close the documented ``pm.start()``
+        race. One predicate, so that guard cannot be correct for one engine and
+        dead for the other.
+        """
+        return bool(self._multi_abort_requested or self._queue_abort_requested)
+
+    def _run_group_job_blocking(self, g: dict):
+        """Build + start one unit's discrete print job and BLOCK the worker thread
+        until it reaches a terminal state (off the GUI thread).
+
+        Returns the execution-log path (or None). Raises on abort / error so the
+        worker's finally retracts to safe Z.
+        """
         job = build_well_plate_job(
             well_positions=[(g["well"], g["center"][0], g["center"][1])],
             path_points=[p for seg in g["segments"] for p in seg],
             settings=g["settings"], pump=g["pump"], flow_rate=0.01,
-            job_name=f"Quick Print — {g['ink_name']} @ {g['well']}",
-            path_segments=g["segments"], return_home=False)
+            job_name=g.get("job_name")
+            or f"Quick Print — {g['ink_name']} @ {g['well']}",
+            path_segments=g["segments"],
+            path_extrusion_profiles=g.get("extrusion_profiles"),
+            return_home=False)
         done = threading.Event()
         result = {"state": None}
         pm = PrintManager(self._controller)
@@ -3579,16 +5015,21 @@ class QuickPrintWorkflowPage(QWidget):
         # no-op for this group (it would run to completion, then the run halts
         # only at the next-group check). Honor a sticky abort request before we
         # start this group's print at all.
-        if self._multi_abort_requested:
+        if self._sequence_abort_requested():
             self._pm = None
             raise AbortException()
         pm.start()
         done.wait()
+        # v7.19 BUGFIX: this used to discard the log path, so after a multi-ink run
+        # `_last_log_path` still pointed at the PREVIOUS single print and "Open
+        # log" opened the wrong file. The logger is created inside start().
+        log_path = getattr(getattr(pm, "exec_logger", None), "path", None)
         self._pm = None
         if result["state"] != PrintState.COMPLETED:
             if result["state"] == PrintState.ABORTED:
                 raise AbortException()
             raise RuntimeError(f"group print {result['state']}")
+        return log_path
 
     def _on_multi_done(self, err: str) -> None:
         self._multi_thread = None
@@ -3603,6 +5044,603 @@ class QuickPrintWorkflowPage(QWidget):
             self._status.setText("Multi-ink print complete — needle at safe Z.")
         self._update_button_state()
 
+    # ══ v7.19: resolve + run the plate-wide queue ═══════════════════
+
+    def _expand_queued_print(self, qp: QueuedPrint, qp_index: int) -> list[dict]:
+        """Resolve ONE queued print into 1+ execution units.
+
+        MUST be called inside ``self._snapshot_applied(qp)`` — everything below
+        reads the widgets. Raises :class:`_QueueResolveError` with an
+        operator-facing reason when the snapshot cannot run at all.
+
+        A single-ink / non-sketch print contributes exactly one unit. A multi-ink
+        sketch contributes one unit per ``_ink_groups()`` entry **in sketch
+        order**, and that ordered run is ATOMIC — see ``_resolve_queue``.
+        """
+        well = qp.well
+        center = self._well_center_zero_ref_mm(well)
+        if center is None:
+            raise _QueueResolveError("could not resolve the well position")
+        # A batch dips into ink and service wells and prints at a computed height,
+        # so it must not run against `_well_center_zero_ref_mm`'s GEOMETRIC
+        # fallback for an uncalibrated well.
+        if self._well_positions and well not in self._well_positions:
+            raise _QueueResolveError("well not calibrated — run Plate Location")
+        print_z = self._resolve_print_z()
+        if print_z is None:
+            raise _QueueResolveError("plate bottom not calibrated")
+
+        units: list[dict] = []
+        if self._is_multi_ink():
+            groups = self._ink_groups()
+            sk = self._loaded_sketch
+            for sub_i, (iid, sub) in enumerate(groups):
+                ink_name = self._ink_map.get(iid)
+                if not ink_name:
+                    raise _QueueResolveError(
+                        f"abstract ink {iid} is not mapped to a configured ink")
+                pump = (self._hw_config.get_pump_for_ink(ink_name)
+                        if self._hw_config else None)
+                if not pump:
+                    raise _QueueResolveError(f"“{ink_name}” has no pump")
+                segments = self._group_segments(sub, pump)
+                if not segments:
+                    continue
+                ink_pos = self._ink_pos_for(ink_name)
+                if ink_pos is None:
+                    raise _QueueResolveError(
+                        f"“{ink_name}” has no calibrated reagent well")
+                label = getattr(sk.ink_by_id(iid), "name", f"ink {iid}") \
+                    if sk else f"ink {iid}"
+                units.append(self._make_unit(
+                    qp, qp_index, sub_i, len(groups), well, center, segments,
+                    pump, ink_name, ink_pos, print_z,
+                    pickup_uL=self._pickup_uL_for_length(
+                        self._segments_length_mm(segments)),
+                    label_extra=label))
+            if not units:
+                raise _QueueResolveError("no printable path")
+            for u in units:
+                u["sub_total"] = len(units)
+            return units
+
+        segments = self._path_segments_for_selection()
+        if not segments:
+            raise _QueueResolveError("selected object produced no printable path")
+        ink_name = self._selected_ink() or ""
+        if not ink_name:
+            # After the single up-front prep (and after every swap) the needle has
+            # been washed out, so "print with whatever is loaded" is a fluidic
+            # continuity claim this engine has already invalidated. Refuse it,
+            # unless nothing is being serviced at all.
+            if self._prep_check.isChecked() or self._postclean_check.isChecked():
+                raise _QueueResolveError(
+                    "no ink selected — Run all needs an explicit ink per print "
+                    "when prep or cleanup is on")
+            ink_pos = None
+            pump = self._pump()
+        else:
+            pump = self._pump()
+            ink_pos = self._ink_pos_for(ink_name)
+            if ink_pos is None:
+                raise _QueueResolveError(
+                    f"“{ink_name}” has no calibrated reagent well")
+        units.append(self._make_unit(
+            qp, qp_index, 0, 1, well, center, segments, pump, ink_name, ink_pos,
+            print_z, pickup_uL=self._compute_pickup_volume_uL()))
+        return units
+
+    def _ink_pos_for(self, ink_name: str):
+        """The calibrated absolute-µm position of *ink_name*'s reagent well."""
+        if not ink_name:
+            return None
+        locs = (getattr(self._hw_config, "ink_locations", {}) or {}) \
+            if self._hw_config else {}
+        wn = resolve_pickup_well(locs.get(ink_name) or [], self._plate)
+        if not wn:
+            return None
+        return (self._well_positions or {}).get(wn)
+
+    def _make_unit(self, qp, qp_index, sub_i, sub_total, well, center, segments,
+                   pump, ink_name, ink_pos, print_z, *, pickup_uL,
+                   label_extra: str = "") -> dict:
+        """One execution unit — a SUPERSET of the multi-ink group dict, so
+        ``_run_group_job_blocking`` consumes it unchanged."""
+        ideal = [(center[0] + px, center[1] + py)
+                 for seg in segments for (px, py) in seg]
+        label = qp.object_label or "print"
+        if label_extra:
+            label = f"{label} · {label_extra}"
+        return {
+            "well": well, "center": center, "segments": segments,
+            "settings": self._build_settings(pump=pump), "pump": pump,
+            "ink_name": ink_name,
+            "ink_pos": ink_pos,
+            "ink_dip_z": self._plate_offset_to_zref(qp.ink_dip_z_mm),
+            "pickup_uL": float(pickup_uL or 0.0),
+            "pickup_kwargs": self._ink_pickup_kwargs(ink_name),
+            "qp_index": qp_index, "sub_index": sub_i, "sub_total": sub_total,
+            "obj_label": qp.object_label,
+            "job_name": f"Quick Print — {label} @ {well}",
+            "print_z_zref": print_z,
+            "ideal_pts": ideal if len(ideal) >= 2 else None,
+        }
+
+    def _resolve_queue(self, queue) -> tuple[list, list, list]:
+        """Resolve every enabled queued print into execution units.
+
+        GUI-THREAD ONLY. Returns ``(units, skipped, warnings)`` where *skipped* is
+        ``[(well, reason)]`` — an entry that cannot run is never silently dropped.
+        Shows NO dialogs (a modal here would re-enter the event loop while a
+        transient snapshot is applied), and restores the on-screen config even
+        when a middle entry raises.
+        """
+        units: list[dict] = []
+        skipped: list[tuple[str, str]] = []
+        warnings: list[str] = []
+        floor_bad: list[tuple[str, float]] = []
+        try:
+            for i, qp in enumerate(queue):
+                if not qp.enabled:
+                    continue
+                problem = self._queue_entry_problem(qp)
+                if problem:
+                    skipped.append((qp.well, problem))
+                    continue
+                try:
+                    with self._snapshot_applied(qp) as clamp_warnings:
+                        warnings.extend(clamp_warnings or [])
+                        got = self._expand_queued_print(qp, i)
+                        # Per-UNIT floor check, evaluated NUMERICALLY: each
+                        # snapshot has its own print height, and a modal inside
+                        # the transient-apply block would let the status tick
+                        # repaint from the wrong snapshot.
+                        for u in got:
+                            z = u.get("print_z_zref")
+                            try:
+                                if z is not None and \
+                                        self._controller.print_floor_violation(z):
+                                    floor_bad.append((u["well"], qp.print_z_mm))
+                            except Exception:
+                                pass
+                        units.extend(got)
+                except _QueueResolveError as exc:
+                    skipped.append((qp.well, str(exc)))
+                except Exception as exc:
+                    logger.exception("resolving %s failed", qp.well)
+                    skipped.append((qp.well, f"could not resolve ({exc})"))
+        finally:
+            # Restore the derived UI exactly once — with signals blocked, none of
+            # the usual refreshes ran.
+            self._on_object_changed()
+            self._on_settings_changed()
+        if floor_bad:
+            seen = []
+            for well, z in floor_bad:
+                if well not in [w for w, _ in seen]:
+                    seen.append((well, z))
+            warnings.append(
+                "below the calibrated plate bottom (will be clamped, so they "
+                "will not print deeper): "
+                + ", ".join(f"{w} at {z:g} mm" for w, z in seen))
+        return units, skipped, warnings
+
+    def _queue_pump_moves(self, units, *, prep_enabled: bool) -> dict:
+        """Ordered signed plunger moves per pump across the WHOLE resolved queue.
+
+        ``+`` = dispense, ``−`` = aspirate (the ``_check_syringe_budget``
+        convention). Models prep once on the first unit's bore, then per unit
+        ``−pickup`` / ``+printed``. Deliberately does NOT model the wash / oil
+        volumes inside ``run_post_clean`` / ``run_print_cleanup`` — that
+        under-claim is DISCLOSED in the confirm dialog rather than hidden.
+        """
+        moves: dict[str, list[float]] = {}
+        needle_uL = needle_volume_uL(self._hw_config) or 0.0
+        if prep_enabled and units:
+            bore = units[0]["pump"]
+            buf = 1.0
+            try:
+                buf = float(self._buffer_needles_spin.value())
+            except Exception:
+                pass
+            moves.setdefault(bore, []).extend(
+                [needle_uL, -needle_uL, -buf * needle_uL])
+        for u in units:
+            lst = moves.setdefault(u["pump"], [])
+            if u.get("pickup_uL"):
+                lst.append(-float(u["pickup_uL"]))
+            try:
+                dispensed = self._print_dispense_volume_uL(u["segments"])
+            except Exception:
+                dispensed = 0.0
+            if dispensed:
+                lst.append(float(dispensed))
+        return moves
+
+    def _check_queue_syringe_budget(self, units, *, prep_enabled: bool) -> dict:
+        """Per pump: ``{"verdict": fits|no_fit|unchecked, …}``.
+
+        The single-print pre-flight models ONE print, and the multi-ink path skips
+        it with no mention anywhere in the UI. A queue is MORE exposed, not less:
+        same-ink adjacency skips the wash, so the plunger drifts monotonically
+        across the batch. So this is computed and one of three verdicts is always
+        stated.
+        """
+        out: dict[str, dict] = {}
+        for pump, moves in self._queue_pump_moves(
+                units, prep_enabled=prep_enabled).items():
+            if not moves:
+                continue
+            try:
+                res = self._controller.simulate_pump_budget(pump, moves)
+            except Exception as exc:
+                out[pump] = {"verdict": "unchecked", "reason": str(exc)}
+                continue
+            if not isinstance(res, dict):
+                out[pump] = {"verdict": "unchecked", "reason": "no result"}
+            elif res.get("ok"):
+                out[pump] = {"verdict": "fits", **res}
+            elif res.get("reason") in ("uncalibrated", "fill_unreadable"):
+                out[pump] = {"verdict": "unchecked", **res}
+            else:
+                out[pump] = {"verdict": "no_fit", **res}
+        return out
+
+    def _on_run_all(self) -> None:
+        """Gate → resolve every queued print on the GUI thread → ONE confirm →
+        ONE worker owning prep-once / per-unit pickup+print / swap-on-ink-change /
+        cleanup-once. Mirrors ``_start_multi_ink_run``'s contract."""
+        if self._is_running():
+            return
+        for t in (self._queue_thread, self._multi_thread,
+                  self._preposition_thread, self._cleanup_thread):
+            if t is not None and t.is_alive():
+                return
+        if not getattr(self._controller, "is_xy_connected", False) or \
+                not getattr(self._controller, "is_zp_connected", False):
+            self._status.setText("Connect the XY and ZP stages first.")
+            return
+        if self._plate is None:
+            self._status.setText("No plate available — run Calibration first.")
+            return
+        if not [qp for qp in self._queue if qp.enabled]:
+            self._status.setText("The queue is empty.")
+            return
+        # A batch ALWAYS services and dips, so a Safe Z is a hard requirement —
+        # not the "continue anyway?" prompt a plain single print offers.
+        if self._safe_z is None:
+            self._status.setText(
+                "Run all needs a Safe Z — set it on the Calibration page.")
+            return
+
+        do_prep = self._prep_check.isChecked()
+        cleanup = self._postclean_check.isChecked()
+        needle_uL = needle_volume_uL(self._hw_config)
+        service_positions, missing = resolve_service_positions(
+            self._hw_config, self._well_positions, self._plate)
+        if do_prep or cleanup:
+            if needle_uL <= 0:
+                self._status.setText(
+                    "Run all needs the needle inner Ø + length (Hardware Setup "
+                    "→ Needle), or turn prep and cleanup off.")
+                return
+            if missing:
+                self._status.setText(
+                    "Run all needs these reagent wells assigned + calibrated: "
+                    f"{', '.join(missing)} — or turn prep and cleanup off.")
+                return
+        service_z = self._plate_offset_to_zref(float(self._service_z_spin.value()))
+        if (do_prep or cleanup) and service_z is None:
+            self._status.setText(
+                "Plate bottom Z not calibrated — can't resolve the service "
+                "dip Z.")
+            return
+
+        ordered = self._ordered_queue()
+        units, skipped, warnings = self._resolve_queue(ordered)
+        if not units:
+            lines = ["Nothing in the queue can run."]
+            lines += [f"  • {w} — {why}" for w, why in skipped]
+            QMessageBox.warning(self, "Nothing to run", "\n".join(lines),
+                                QMessageBox.StandardButton.Ok)
+            self._status.setText("Nothing in the queue can run — see dialog.")
+            return
+
+        force_clean = self._queue_clean_between()
+        swaps = count_ink_swaps(units, force_clean_between=force_clean)
+        alt_mode = ORDER_PLATE if self._queue_group_by_ink() else ORDER_INK
+        try:
+            alt_units, _s, _w = None, None, None
+            alt_swaps = count_ink_swaps(
+                [{"ink_name": u["ink_name"]} for u in units]
+                if alt_mode == ORDER_PLATE else
+                # Cheap counterfactual: re-order the RESOLVED units by ink while
+                # keeping each print's own units together.
+                sorted(units, key=lambda u: (u["ink_name"], u["qp_index"],
+                                             u["sub_index"])),
+                force_clean_between=force_clean)
+        except Exception:
+            alt_swaps = None
+
+        budget = self._check_queue_syringe_budget(units, prep_enabled=do_prep)
+        blocked = [p for p, v in budget.items() if v["verdict"] == "no_fit"]
+
+        lines = [f"Run all {len({u['qp_index'] for u in units})} queued print"
+                 f"{'' if len(units) == 1 else 's'} "
+                 f"({len(units)} print unit"
+                 f"{'' if len(units) == 1 else 's'}, "
+                 f"{len({u['well'] for u in units})} wells)."]
+        lines.append("  • Prep the needle ONCE now (waste → oil → wash → buffer)"
+                     if do_prep else
+                     "  • No prep — the needle is used as-is.")
+        lines.append("")
+        lines.append("Order: " + ("grouped by ink" if self._queue_group_by_ink()
+                                  else "plate order"))
+        for n, u in enumerate(units, 1):
+            atom = (f" [{u['sub_index'] + 1}/{u['sub_total']} of one sketch]"
+                    if u["sub_total"] > 1 else "")
+            lines.append(
+                f"  {n}. {u['well']} — {u['obj_label'] or 'print'} — "
+                f"{u['ink_name'] or '(loaded)'} ({u['pump']}) — "
+                f"pick up {u['pickup_uL']:.3f} µL{atom}")
+        swap_line = (f"  • {swaps} ink swap{'' if swaps == 1 else 's'} "
+                     "(waste → wash → buffer each)")
+        if alt_swaps is not None and alt_swaps != swaps:
+            swap_line += (f" — {'plate order' if self._queue_group_by_ink() else 'Group by ink'}"
+                          f" would need {alt_swaps}")
+        lines.append("")
+        lines.append(swap_line)
+        lines.append("  • Clean the needle ONCE at the end" if cleanup else
+                     "  • No cleanup — the needle will still hold ink/buffer "
+                     "when this finishes.")
+        for pump, v in budget.items():
+            if v["verdict"] == "fits":
+                lines.append(
+                    f"  • Syringe budget {pump}: OK — spans "
+                    f"{v.get('span_uL', 0.0):.2f} µL of "
+                    f"{v.get('capacity_uL', 0.0):.2f} µL (print + pickup moves "
+                    "only; the wash/prep volumes are not modelled)")
+            elif v["verdict"] == "no_fit":
+                lines.append(
+                    f"  • Syringe budget {pump}: WON'T FIT — needs "
+                    f"{v.get('span_uL', 0.0):.2f} µL but holds "
+                    f"{v.get('capacity_uL', 0.0):.2f} µL")
+            else:
+                lines.append(
+                    f"  • Syringe budget {pump}: NOT CHECKED "
+                    f"({v.get('reason', 'unavailable')})")
+        if skipped:
+            lines.append("")
+            lines.append("⚠ NOT running:")
+            lines += [f"    {w} — {why}" for w, why in skipped]
+        if warnings:
+            lines.append("")
+            lines += [f"⚠ {w}" for w in warnings]
+        lines.append("")
+        lines.append("All prints use the current between-lines, travel and "
+                     "pre-flow settings.")
+        lines.append(
+            "Once started this runs unattended. Abort stops after the current "
+            "step and retracts to safe Z; the needle will still hold ink.")
+
+        if blocked:
+            QMessageBox.warning(
+                self, "Won't fit the syringe",
+                "\n".join(lines)
+                + "\n\nReduce the queue, the print sizes or the ink padding, or "
+                  "tick “Clean between every print” so the syringe is reset each "
+                  "time.",
+                QMessageBox.StandardButton.Ok)
+            self._status.setText(
+                f"Run all blocked — {', '.join(blocked)} won't fit the syringe.")
+            return
+        lines.append("")
+        lines.append("Hardware set up correctly and ready to start?")
+        if QMessageBox.question(
+                self, "Confirm run all", "\n".join(lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            self._status.setText("Cancelled.")
+            return
+
+        self._queue_abort_requested = False
+        self._hold_requested = False
+        self._queue_is_held = False
+        self._hold_event.clear()
+        self._queue_results = []
+        self._queue_ran = 0
+        self._queue_total = len(units)
+        self._queue_swaps = swaps
+        self._print_btn.setEnabled(False)
+        self._run_all_btn.setEnabled(False)
+        self._abort_btn.setEnabled(True)
+        self._hold_btn.setEnabled(True)
+        self._status.setText(f"Run all: {len(units)} prints…")
+
+        bridge = self._bridge
+        safe_z = float(self._safe_z)
+        wash_cycles = int(self._wash_cycles_spin.value())
+        buffer_needles = float(self._buffer_needles_spin.value())
+
+        def _worker():
+            err = None
+            executor = None
+            prev_ink = None
+            ran = 0
+            try:
+                executor = PickPlaceExecutor(self._controller, self._hw_config)
+                executor.safe_z_mm = safe_z
+                executor.needle_volume_uL = needle_uL
+                executor.service_z_mm = service_z
+                executor.wash_cycles = wash_cycles
+                executor.buffer_needles = buffer_needles
+                # Clear several needles on a swap so no prior ink carries over.
+                executor.post_dispense_needles = 6.0
+                for role in ("waste", "oil", "wash", "buffer"):
+                    if role in service_positions:
+                        setattr(executor, f"{role}_well_pos",
+                                service_positions[role])
+                executor.on_sub_step = (
+                    lambda op, step: bridge.progress.emit(0, 0, str(step)))
+                self._active_executor = executor
+                if do_prep:
+                    executor.prep_bore = units[0]["pump"]
+                    executor.run_prep()
+                for u in units:
+                    if self._sequence_abort_requested():
+                        raise AbortException()
+                    if not getattr(self._controller, "is_zp_connected", False):
+                        raise AbortException()
+                    # ── hold at a WELL BOUNDARY ────────────────────
+                    if self._hold_requested:
+                        self._hold_requested = False
+                        try:
+                            executor._retract_to_safe_z()
+                        except Exception:
+                            pass
+                        self._hold_event.clear()
+                        bridge.queue_held.emit(True)
+                        self._hold_event.wait()
+                        bridge.queue_held.emit(False)
+                        if self._sequence_abort_requested():
+                            raise AbortException()
+                    executor.prep_bore = u["pump"]
+                    need_swap = (prev_ink is not None
+                                 and (force_clean
+                                      or u["ink_name"] != prev_ink))
+                    if need_swap:
+                        bridge.progress.emit(
+                            0, 0, f"Ink swap → {u['ink_name']}…")
+                        executor.run_post_clean()
+                    if u["ink_pos"] is not None and u["pickup_uL"] > 0:
+                        bridge.progress.emit(
+                            0, 0, f"Picking up {u['pickup_uL']:.3f} µL of "
+                                  f"{u['ink_name']}…")
+                        executor.aspirate_ink(
+                            u["ink_pos"], u["pickup_uL"], bore=u["pump"],
+                            z_mm=u["ink_dip_z"], **u.get("pickup_kwargs", {}))
+                    bridge.queue_unit.emit(ran + 1, len(units), u["job_name"])
+                    log_path = self._run_group_job_blocking(u)
+                    self._queue_results.append({
+                        "qp_index": u["qp_index"], "well": u["well"],
+                        "obj_label": u["obj_label"], "ink_name": u["ink_name"],
+                        "log_path": log_path, "ideal_pts": u["ideal_pts"],
+                    })
+                    prev_ink = u["ink_name"]
+                    ran += 1
+                    self._queue_ran = ran
+                if cleanup:
+                    executor.run_print_cleanup()
+            except AbortException:
+                err = "aborted"
+            except Exception as e:
+                logger.exception("Quick Print run-all failed: %s", e)
+                err = str(e)
+            finally:
+                if err is None and executor is not None:
+                    try:
+                        if executor._abort_flag.is_set():
+                            err = "aborted"
+                    except Exception:
+                        pass
+                if executor is not None:
+                    try:
+                        executor._retract_to_safe_z()
+                    except Exception:
+                        pass
+                self._active_executor = None
+                self._pm = None
+            self._queue_ran = ran
+            bridge.queue_done.emit(err or "")
+
+        self._queue_thread = threading.Thread(
+            target=_worker, name="QuickPrintRunAll", daemon=True)
+        self._queue_thread.start()
+        self._update_button_state()
+
+    def _on_queue_unit(self, index: int, total: int, label: str) -> None:
+        """GUI thread: the queue advanced. `_set_print_live` drives a QTimer, so it
+        may only be toggled here — never from the worker."""
+        self._status.setText(f"Print {index}/{total}: {label}")
+        self._set_print_live(True)
+
+    def _on_queue_held(self, held: bool) -> None:
+        self._queue_is_held = bool(held)
+        if held:
+            self._set_print_live(False)
+            left = max(0, self._queue_total - self._queue_ran)
+            self._status.setText(
+                f"Held after {self._queue_ran} of {self._queue_total} prints — "
+                "needle at safe Z. The stage is free, so you can run another "
+                f"workflow now. Press “Resume ({left} left)” to continue.")
+        else:
+            self._status.setText("Resuming…")
+        self._update_button_state()
+
+    def _on_hold_clicked(self) -> None:
+        if self._queue_thread is None or not self._queue_thread.is_alive():
+            return
+        if self._queue_is_held:
+            # ⚠ A PROXY, not a lease: this catches another workflow's scan or
+            # print (both suspend the poller for their duration), but not a manual
+            # jog, and it cannot name which workflow is driving.
+            try:
+                busy = bool(self._controller.is_position_poller_suspended())
+            except Exception:
+                busy = False
+            if busy:
+                self._status.setText(
+                    "Something else is driving the stage right now (a scan or a "
+                    "print). Wait for it to finish, then Resume.")
+                return
+            if not getattr(self._controller, "is_xy_connected", False) or \
+                    not getattr(self._controller, "is_zp_connected", False):
+                self._status.setText(
+                    "Reconnect the XY and ZP stages before resuming.")
+                return
+            self._hold_event.set()
+        else:
+            self._hold_requested = True
+            self._status.setText(
+                "Will hold after the print currently running.")
+            self._update_button_state()
+
+    def _on_queue_done(self, err: str) -> None:
+        self._queue_thread = None
+        self._queue_abort_requested = False
+        self._hold_requested = False
+        self._queue_is_held = False
+        self._hold_event.clear()
+        self._pm = None
+        self._set_print_live(False)
+        ran, total = self._queue_ran, self._queue_total
+        swaps = self._queue_swaps
+        if err == "aborted":
+            self._status.setText(
+                f"Run all aborted after {ran} of {total} prints — needle at safe "
+                "Z. ⚠ Cleanup did NOT run, so the needle still holds "
+                "ink/buffer, and the dispensed volume of the interrupted print "
+                "is indeterminate.")
+        elif err:
+            self._status.setText(
+                f"Run all failed after {ran} of {total} prints: {err}")
+        else:
+            self._status.setText(
+                f"Ran {ran} of {total} prints ({swaps} ink "
+                f"swap{'' if swaps == 1 else 's'}) — needle at safe Z.")
+        last = next((r for r in reversed(self._queue_results)
+                     if r.get("log_path")), None)
+        if last is not None:
+            self._last_log_path = last["log_path"]
+            self._refresh_log_button()
+            self._load_report(
+                last["log_path"], ideal_pts=last.get("ideal_pts"),
+                context={"object": last.get("obj_label") or "",
+                         "well": last.get("well") or "",
+                         "queue": f"print {ran} of {total}"})
+        self._update_button_state()
+
     def _on_print(self):
         if self._is_running():
             return
@@ -3611,6 +5649,14 @@ class QuickPrintWorkflowPage(QWidget):
         if (self._preposition_thread is not None
                 and self._preposition_thread.is_alive()):
             return  # a positioning / preflight move is already in flight
+        # v7.19: a queued run owns the machine for the whole batch. (And the
+        # _cleanup_thread guard closes a pre-existing hole: a post-print cleanup
+        # could be running while Print was re-clicked, with only the 300 ms status
+        # tick standing between them.)
+        if self._queue_thread is not None and self._queue_thread.is_alive():
+            return
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            return
         if not getattr(self._controller, "is_xy_connected", False) or \
                 not getattr(self._controller, "is_zp_connected", False):
             self._status.setText("Connect the XY and ZP stages first.")
@@ -3638,7 +5684,9 @@ class QuickPrintWorkflowPage(QWidget):
             return
 
         try:
-            path_segments = self._path_segments_for_selection()
+            # v7.21.5: the modifiers come back beside the segments, so the print
+            # deposits what the sketch computed per shape instead of one flow.
+            path_segments, path_mods =                 self._segments_and_modifiers_for_selection()
         except Exception as e:
             logger.exception("Quick Print geometry failed: %s", e)
             self._status.setText(f"Geometry error: {e}")
@@ -3849,6 +5897,11 @@ class QuickPrintWorkflowPage(QWidget):
                     lines.append(
                         f"      + circular pickup "
                         f"({pickup_kwargs['orbit_diameter_mm']:.2f} mm)")
+            hold_s = self._hold_in_liquid_s()
+            if hold_s > 0:
+                lines.append(
+                    f"      + hold in the liquid {hold_s:.1f}s before lifting "
+                    "(so the aspirate does not finish in air)")
             lines.append(f"  • Print “{obj_label}” in well {well}")
             if cleanup_enabled:
                 lines.append(
@@ -3869,6 +5922,10 @@ class QuickPrintWorkflowPage(QWidget):
             "well": well, "center": center, "path_points": path_points,
             "path_segments": path_segments, "settings": settings,
             "pump": pump, "obj_label": obj_label, "cleanup": cleanup_ctx,
+            # v7.21.5: resolved HERE, while the selection is known — the
+            # continuation runs after a worker thread and must not re-derive
+            # geometry (the operator may have touched a control meanwhile).
+            "extrusion_profiles": self._vol_per_mm_profiles(path_mods),
         }
 
         self._print_btn.setEnabled(False)
@@ -4032,6 +6089,10 @@ class QuickPrintWorkflowPage(QWidget):
             # v7.5.x: one PRINT_PATH per object with lift→travel→lower between
             # them, so a multi-object print doesn't extrude across the seams.
             path_segments=path_segments,
+            # v7.21.5: each sub-path's own deposition (µL/mm per segment) from
+            # the sketch's baked extrusion profile, so declared line widths and
+            # no-extrude sections print as designed. None → one flow (legacy).
+            path_extrusion_profiles=ctx.get("extrusion_profiles"),
             return_home=False,
         )
 
@@ -4252,6 +6313,26 @@ class QuickPrintWorkflowPage(QWidget):
         # the phase-specific flags below only stop the SOFTWARE from issuing
         # more commands.
         self._kick_abort_all_motion()
+        # v7.19: a queued run — same shape as the multi-ink branch below, PLUS
+        # waking a HELD worker. Without the _hold_event.set() an abort pressed
+        # while the batch is parked would never reach the loop at all.
+        if self._queue_thread is not None and self._queue_thread.is_alive():
+            self._queue_abort_requested = True
+            self._hold_event.set()
+            ex = self._active_executor
+            if ex is not None:
+                try:
+                    ex._abort_flag.set()
+                except Exception:
+                    pass
+            if self._pm is not None:
+                try:
+                    self._pm.abort()
+                except Exception:
+                    pass
+            self._status.setText(
+                "Abort requested — finishing the current step…")
+            return
         # v7.5.x: a multi-ink run — set its sticky flag AND abort whichever
         # sub-step is live (the executor between/around prints, or the
         # PrintManager during one group's print).
@@ -4356,6 +6437,14 @@ class QuickPrintWorkflowPage(QWidget):
             # v7.7: a finished print goes somewhere instead of nowhere.
             self._load_report(log_path)
         self._update_button_state()
+        # v7.20: tell an embedding host LAST, so by the time its slot runs `_pm`
+        # is cleared, `_last_log_path` is set, live sampling is stopped and any
+        # cleanup worker has already been started (which the host must wait for
+        # via `cleanup_running()` before trusting where the stage is).
+        try:
+            self.print_state_changed.emit(st)
+        except Exception as e:
+            logger.debug("print_state_changed emit failed: %s", e)
 
     def _start_cleanup_worker(self, cleanup_ctx: dict) -> None:
         """Run the post-print cleanup (waste → wash → reset oil) on a worker
@@ -4426,6 +6515,12 @@ class QuickPrintWorkflowPage(QWidget):
             self._status.setText(
                 "Print done — needle cleaned (waste → wash → reset oil).")
         self._update_button_state()
+        # v7.20: the stage has stopped being driven by the cleanup — an embedding
+        # host may now reposition and trust where the needle is.
+        try:
+            self.cleanup_finished.emit(err or "")
+        except Exception as e:
+            logger.debug("cleanup_finished emit failed: %s", e)
 
     def _on_pause(self):
         """Toggle pause on the running print (v7.7 — previously unreachable)."""
@@ -4446,11 +6541,19 @@ class QuickPrintWorkflowPage(QWidget):
             self._status.setText(f"Pause failed: {e}")
         self._update_button_state()
 
-    def _load_report(self, log_path) -> None:
+    def _load_report(self, log_path, *, ideal_pts=None, context=None) -> None:
         """v7.7: build the Report zone from the run that just finished and show
         it. The prediction is passed alongside so the report can put predicted
         and measured side by side — the comparison that makes the simulator's
         optimism visible instead of a private discovery.
+
+        v7.19 BUGFIX: *ideal_pts* / *context* may be given explicitly. Defaults
+        preserve the single-print behaviour, but ``_ideal_path_mm`` reads the LIVE
+        widgets and ``_selected_well``, so after a queue run the report would
+        otherwise have scored the last unit's executed trace against whatever
+        object happened to be on screen, in whatever well was selected — a
+        silently wrong accuracy number in a report whose whole purpose is
+        credible accuracy.
 
         Best-effort: a report that cannot be built must never disturb the
         machine state a finished print left behind.
@@ -4463,10 +6566,12 @@ class QuickPrintWorkflowPage(QWidget):
             p95 = getattr(self, "_predicted_p95_um", None)
             if p95 is not None:
                 predicted["p95_um"] = p95
-            ideal = self._ideal_path_mm()
+            ideal = ideal_pts if ideal_pts is not None else self._ideal_path_mm()
+            ctx = context if context is not None else {
+                "object": self._object_label(),
+                "well": self._selected_well or ""}
             ok = panel.load(log_path, ideal_pts=ideal, predicted=predicted,
-                            context={"object": self._object_label(),
-                                     "well": self._selected_well or ""})
+                            context=ctx)
             if ok:
                 self.show_zone("report")
         except Exception as exc:
@@ -4519,7 +6624,9 @@ class QuickPrintWorkflowPage(QWidget):
                        or (self._cleanup_thread is not None
                            and self._cleanup_thread.is_alive())
                        or (self._multi_thread is not None
-                           and self._multi_thread.is_alive()))
+                           and self._multi_thread.is_alive())
+                       or (self._queue_thread is not None
+                           and self._queue_thread.is_alive()))
         connected = (getattr(self._controller, "is_xy_connected", False)
                      and getattr(self._controller, "is_zp_connected", False))
         ready = (connected and self._selected_well is not None
@@ -4539,6 +6646,59 @@ class QuickPrintWorkflowPage(QWidget):
                     f"{c.label}: {c.detail}" for c in blocking)
                 if blocking else "Start the print.")
         self._print_btn.setEnabled(ready and not running and not positioning)
+        if self._queue:
+            self._print_btn.setToolTip(
+                (self._print_btn.toolTip() or "")
+                + f"\n(Runs only the ACTIVE print, in "
+                  f"{self._selected_well or 'the selected well'}. Use “Run all "
+                  f"queued” for the whole plate.)")
+        # v7.19: Run all is gated on the readiness model MINUS the two checks that
+        # describe the ACTIVE on-screen print — the queue supplies its own object
+        # and well per entry, so blocking on those would refuse a perfectly valid
+        # queue because the object combo was left empty. Per-entry refusals come
+        # from _resolve_queue, by name.
+        if hasattr(self, "_run_all_btn"):
+            n_queued = len([qp for qp in self._queue if qp.enabled])
+            blockers = []
+            if readiness is not None:
+                blockers = [c for c in readiness.blocking()
+                            if c.id not in ("object", "well")]
+            queue_ready = (connected and self._plate is not None
+                           and n_queued > 0 and not blockers)
+            self._run_all_btn.setEnabled(
+                queue_ready and not running and not positioning)
+            self._run_all_btn.setText(
+                f"Run all queued ({n_queued})" if n_queued else "Run all queued")
+            if n_queued == 0:
+                self._run_all_btn.setToolTip(
+                    "Nothing queued. Select wells on the plate and use “Apply "
+                    "print to wells”.")
+            elif blockers:
+                self._run_all_btn.setToolTip(
+                    "Not ready — " + "; ".join(
+                        f"{c.label}: {c.detail}" for c in blockers))
+            else:
+                self._run_all_btn.setToolTip(
+                    f"Run all {n_queued} queued prints: one needle prep, then "
+                    "each well's own print, then one cleanup.")
+        if hasattr(self, "_hold_btn"):
+            queue_live = (self._queue_thread is not None
+                          and self._queue_thread.is_alive())
+            self._hold_btn.setEnabled(queue_live)
+            if self._queue_is_held:
+                left = max(0, self._queue_total - self._queue_ran)
+                self._hold_btn.setText(f"Resume ({left} left)")
+                self._hold_btn.setToolTip(
+                    "Continue the queue. Refused while another workflow is "
+                    "driving the stage.")
+            else:
+                self._hold_btn.setText("Hold after well")
+                self._hold_btn.setToolTip(
+                    "Finish the print now running, retract to safe Z and wait. "
+                    "The stage is then free, so you can image the plate or run "
+                    "another workflow before resuming."
+                    if queue_live else
+                    "Available while a queued run is in progress.")
         # v7.7: Abort is live during a print AND during ANY positioning phase.
         # It used to be gated on `self._active_executor is not None`, which left
         # it DEAD through a plain-print preposition — i.e. while the stage was

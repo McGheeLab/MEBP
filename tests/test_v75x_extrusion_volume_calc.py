@@ -147,8 +147,12 @@ class TestPumpAccumulation(unittest.TestCase):
 
 class TestSketchCanonicalBeadModel(unittest.TestCase):
     def _line(self, mult=1.0, lh=0.2):
+        # v7.21.5: the declared line width IS the shape's extrusion modifier
+        # (1× = one reference bead = the orifice inner Ø), so declare the
+        # reference width to measure the canonical bore-area model.
         sk = Sketch(shapes=[SketchShape(
-            kind="line", points=[(0.0, 0.0), (10.0, 0.0)])])
+            kind="line", points=[(0.0, 0.0), (10.0, 0.0)],
+            line_width_mm=NEEDLE_27G.id_um / 1000.0)])
         sk.line_spacing_mm = 0.72       # ≈ outer Ø — must NOT enter the volume
         sk.layer_height_mm = lh
         sk.extrusion_multiplier = mult

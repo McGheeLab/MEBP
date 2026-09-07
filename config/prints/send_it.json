@@ -1,0 +1,644 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "send_it",
+    "description": "send_it: 16 shape(s), 1 layer(s), 101.4 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-08-20T01:59:20.286125+00:00",
+    "modified": "2026-08-20T01:59:20.286125+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "send_it": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\send_it.csv",
+        "csv_path": "config\\prints\\send_it.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 236,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "circle",
+              "cx": -5.069175826478114,
+              "cy": -4.568222790147663,
+              "radius": 1.4577138557079823,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -1.879696394686907,
+                -2.634535104364326
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.736,
+              "id": 1
+            },
+            {
+              "kind": "circle",
+              "cx": -5.069175826478114,
+              "cy": 4.869067157283809,
+              "radius": 1.4577138595775394,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -3.6853889943074,
+                1.7908918406072105
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 0.767,
+              "id": 2
+            },
+            {
+              "kind": "circle",
+              "cx": 5.018793992874102,
+              "cy": -4.568222786436129,
+              "radius": 1.4577138492749715,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.75,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                3.759392789373814,
+                -1.7464895635673623
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 1.736,
+              "id": 3
+            },
+            {
+              "kind": "circle",
+              "cx": 5.018793993350338,
+              "cy": 4.869067162681822,
+              "radius": 1.4577138362834232,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.4717267552182163,
+                1.6132827324478176
+              ],
+              "overlap_mode": "distance",
+              "overlap_distance_mm": 0.765,
+              "id": 4
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -5.104946908596102,
+                  3.983673281777524
+                ],
+                [
+                  -5.032022109803016,
+                  -3.819280189082769
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 13
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -5.032022109803016,
+                  -3.819280189082769
+                ],
+                [
+                  -4.50921625028433,
+                  -4.097320971368269
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 14
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.50921625028433,
+                  -4.097320971368269
+                ],
+                [
+                  -0.18996204688108786,
+                  0.6212803359992614
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 15
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.18996204688108786,
+                  0.6212803359992614
+                ],
+                [
+                  4.297438305559746,
+                  -4.181394045887067
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 16
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.297438305559746,
+                  -4.181394045887067
+                ],
+                [
+                  4.959513767395281,
+                  -3.761028673293077
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 17
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.959513767395281,
+                  -3.761028673293077
+                ],
+                [
+                  5.02256857328438,
+                  4.063150953362164
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 18
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  5.016280130489902,
+                  3.99788854284806
+                ],
+                [
+                  4.953225324600801,
+                  -3.8262910838071793
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.953225324600801,
+                  -3.798336577603163
+                ],
+                [
+                  4.291149862765268,
+                  -4.218701950197154
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.291149862765268,
+                  -4.218701950197154
+                ],
+                [
+                  -0.1962504896755659,
+                  0.5839724316891757
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.1962504896755659,
+                  0.5839724316891757
+                ],
+                [
+                  -4.515504693078807,
+                  -4.134628875678355
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.515504693078807,
+                  -4.134628875678355
+                ],
+                [
+                  -5.038310552597496,
+                  -3.8565880933928556
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -5.038310552597496,
+                  -3.8565880933928556
+                ],
+                [
+                  -5.11123535139058,
+                  3.946365377467432
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.0,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.2,
+              "no_print": false
+            }
+          ],
+          "inks": [
+            {
+              "id": 1,
+              "name": "Ink 1",
+              "color": "#89b4fa"
+            }
+          ],
+          "_next_ink_id": 2,
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 1.0,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0,
+          "constraints": [
+            {
+              "id": 1,
+              "kind": "equal_radius",
+              "refs": [
+                [
+                  1,
+                  "shape"
+                ],
+                [
+                  2,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 2,
+              "kind": "equal_radius",
+              "refs": [
+                [
+                  3,
+                  "shape"
+                ],
+                [
+                  4,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 3,
+              "kind": "equal_radius",
+              "refs": [
+                [
+                  1,
+                  "shape"
+                ],
+                [
+                  3,
+                  "shape"
+                ]
+              ]
+            },
+            {
+              "id": 4,
+              "kind": "horizontal",
+              "refs": [
+                [
+                  1,
+                  "center"
+                ],
+                [
+                  3,
+                  "center"
+                ]
+              ]
+            },
+            {
+              "id": 5,
+              "kind": "horizontal",
+              "refs": [
+                [
+                  2,
+                  "center"
+                ],
+                [
+                  4,
+                  "center"
+                ]
+              ]
+            },
+            {
+              "id": 6,
+              "kind": "vertical",
+              "refs": [
+                [
+                  3,
+                  "center"
+                ],
+                [
+                  4,
+                  "center"
+                ]
+              ]
+            },
+            {
+              "id": 7,
+              "kind": "vertical",
+              "refs": [
+                [
+                  1,
+                  "center"
+                ],
+                [
+                  2,
+                  "center"
+                ]
+              ]
+            },
+            {
+              "id": 22,
+              "kind": "coincident",
+              "refs": [
+                [
+                  14,
+                  "p0"
+                ],
+                [
+                  13,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 23,
+              "kind": "coincident",
+              "refs": [
+                [
+                  15,
+                  "p0"
+                ],
+                [
+                  14,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 24,
+              "kind": "coincident",
+              "refs": [
+                [
+                  16,
+                  "p0"
+                ],
+                [
+                  15,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 25,
+              "kind": "coincident",
+              "refs": [
+                [
+                  17,
+                  "p0"
+                ],
+                [
+                  16,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 26,
+              "kind": "coincident",
+              "refs": [
+                [
+                  18,
+                  "p0"
+                ],
+                [
+                  17,
+                  "p1"
+                ]
+              ]
+            }
+          ]
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

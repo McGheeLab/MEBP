@@ -12,7 +12,7 @@
         "offset_x": 0.06
       },
       "name": "Tucsen Camera",
-      "date": "2026-08-12",
+      "date": "2026-08-13",
       "image_correction": {
         "brightness": 0,
         "contrast": 1.0,
@@ -37,7 +37,8 @@
         "flip_x": true,
         "flip_y": false
       },
-      "rotation_deg": 89.7151
+      "rotation_deg": -2.0,
+      "flip_y": true
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&2663b984&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "image_correction": {
@@ -76,11 +77,14 @@
         ]
       },
       "autostart": true
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&fd36980&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "autostart": true
     }
   },
   "assignments": {
-    "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&2663b984&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&2a929724&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&fd36980&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#9&16a804ab&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
     "microscope": "tucam:0"
   }
 }

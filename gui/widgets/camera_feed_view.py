@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QEvent, QPointF, QTimer
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QColor, QBrush, QFont, QMouseEvent,
+    QPainterPath,
 )
 
 from gui.styles import COLORS
@@ -175,6 +176,11 @@ class CameraFeedView(QWidget):
         # µm (pixel_to_stage_offset label space). Fixed in the frame, so no
         # stage tracking is needed; projected via the calibrated inverse map.
         self._bore_markers: list[tuple[str, float, float, str]] = []
+        # v7.20: polylines in the SAME camera-centre-relative µm frame as the
+        # bore dots — (points, color_hex, dashed). Used to lay a commanded
+        # toolpath over the feed so the operator can see the stroke against the
+        # real bead. See set_stage_paths for why the frame choice matters.
+        self._stage_paths: list[tuple[tuple, str, bool]] = []
         # v7.5.x: display-only view orientation (correct a mirrored/rotated
         # camera so the operator sees an upright, un-mirrored feed). The RAW
         # frame is untouched; clicks are inverted back to raw pixel coords so
@@ -474,6 +480,84 @@ class CameraFeedView(QWidget):
         if upp <= 0.0:
             upp = 1.0
         return raw_w / 2.0 + float(dx_um) / upp, raw_h / 2.0 + float(dy_um) / upp
+
+    def set_stage_paths(self, paths) -> None:
+        """v7.20: overlay POLYLINES on the feed, in the bore-marker frame.
+
+        ``paths``: iterable of ``(points, color_hex, dashed)`` where ``points``
+        is a sequence of ``(dx_um, dy_um)`` offsets from the CAMERA CENTRE in
+        stage-frame µm — the SAME label space as :meth:`set_bore_markers`, and
+        therefore the exact inverse of the click path. Sharing that one frame is
+        what keeps a drawn path, the dots at its ends and a click on it
+        registered with each other on a rotated or mirrored camera; a second
+        convention here would be a sign error waiting to happen.
+
+        To pin a path to an ABSOLUTE stage position, subtract the live stage
+        position before pushing and re-push on the status tick: panning the
+        stage then slides the overlay across the frame and it stays on the
+        physical feature.
+
+        ``None``/empty clears. Change-gated like the markers, so pushing from a
+        3–7 Hz tick costs nothing when nothing moved.
+        """
+        norm: list[tuple[tuple, str, bool]] = []
+        for p in (paths or ()):
+            try:
+                pts, colour, dashed = p[0], str(p[1]), bool(p[2])
+                clean = tuple((float(q[0]), float(q[1])) for q in pts)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if len(clean) >= 2:
+                norm.append((clean, colour, dashed))
+        if norm == self._stage_paths:
+            return
+        self._stage_paths = norm
+        self._rerender_last()
+
+    def _draw_stage_paths(self, pixmap: QPixmap, true_xf=None):
+        """v7.20: stroke each polyline through the calibrated inverse map.
+
+        Deliberately NO per-point off-frame skip (unlike the bore dots): for a
+        LINE the interesting case is that both endpoints are outside the view
+        and only the middle crosses it, so culling on the endpoints would blank
+        the overlay exactly when it is most useful. The clip rect does the work
+        instead, and it also keeps a very long line at a small µm/px from
+        reaching the rasteriser un-bounded.
+        """
+        disp_w, disp_h = pixmap.width(), pixmap.height()
+        if not disp_w or not disp_h:
+            return
+        raw_w, raw_h = self._last_image_size
+        if not raw_w or not raw_h:
+            raw_w, raw_h = disp_w, disp_h
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setClipRect(-8, -8, disp_w + 16, disp_h + 16)
+        w = max(2, pixmap.width() // 500)
+        for pts, colour_hex, dashed in self._stage_paths:
+            colour = QColor(colour_hex)
+            if not colour.isValid():
+                colour = QColor(COLORS.get("teal", "#94e2d5"))
+            pen = QPen(colour, w)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            if dashed:
+                # setDashPattern IMPLICITLY sets CustomDashLine, so a preceding
+                # setStyle(DashLine) would be dead — and a redundant second
+                # enforcement point is what lets a mutation of one of them look
+                # harmless. Pattern units are pen widths.
+                pen.setDashPattern([5.0, 4.0])
+            painter.setPen(pen)
+            path = QPainterPath()
+            for i, (dx_um, dy_um) in enumerate(pts):
+                ix, iy = self._bore_marker_raw_px(dx_um, dy_um, raw_w, raw_h)
+                ix, iy = self._map_to_pixmap(true_xf, ix, iy)
+                if i == 0:
+                    path.moveTo(ix, iy)
+                else:
+                    path.lineTo(ix, iy)
+            painter.drawPath(path)
+        painter.end()
 
     def set_alignment_ghost(self, image: Optional[QImage],
                             opacity: float = 0.45,
@@ -1202,6 +1286,11 @@ class CameraFeedView(QWidget):
         # v7.5.x: persistent reference markers projected from stage µm
         if self._ref_markers and self._ref_um_per_px > 0:
             self._draw_reference_markers(pixmap, true_xf)
+
+        # v7.20: commanded toolpaths, UNDER the dots — the dots label the ends
+        # of these paths, so they must not be painted over.
+        if self._stage_paths:
+            self._draw_stage_paths(pixmap, true_xf)
 
         # v7.13: needle-bore dots (camera-centre-relative, fixed in frame)
         if self._bore_markers:

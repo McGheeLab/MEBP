@@ -68,6 +68,22 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
         from PySide6.QtWidgets import QApplication
         cls._app = QApplication.instance() or QApplication(sys.argv)
 
+    def setUp(self):
+        """Isolate the per-machine timing store for EVERY test in this class.
+
+        v7.21.2: editing the XY max in max-mode routes through
+        `XYCalibrationRun.commit_top_speed`, which writes the timing store —
+        and `get_store()` is a process-wide singleton pointing at the REAL
+        rig's calibration file. Without this, any test that touches
+        `spin_xy_pct` writes a fake top speed into
+        config/hardware/<machine>/print_timing_calibration.json, and every
+        later test in the process then sees a machine that has been
+        "declared". It is a per-test fixture, not per-class, because
+        `use_temp_store` restores via addCleanup.
+        """
+        from tests.support.store_fixture import use_temp_store
+        use_temp_store(self)
+
     def _ctrl(self):
         c = mock.MagicMock()
         c.is_xy_connected = True
@@ -136,11 +152,30 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
 
     # 3 — editing XY max writes the shared source + persists + notifies
     def test_max_mode_edit_writes_source(self):
+        """v7.21.2: editing XY max here routes through the ONE writer.
+
+        This branch used to set ``safety_limits.max_xy_speed`` and nothing else —
+        moving the 100 % anchor that every jog/print percentage reads while leaving
+        the XYStage still converting mm/s against a stale denominator, so every
+        commanded speed came out wrong by the ratio of the two. It also never wrote
+        ``device_profile.xy_max_speed_um_s`` (so the value did not survive a
+        restart) nor the timing store the simulator reads.
+
+        Reverting the delegation in ``control_panel._write_axis_max`` must fail
+        this test.
+        """
+        # ⚠ Store isolation comes from setUp (see there for why).
+        # Since v7.21.2 this edit routes through
+        # `commit_top_speed`, which writes the per-machine timing store — and the
+        # store is a process-wide singleton pointing at the REAL rig's file.
         s = _Settings()
         p, c = self._panel(speed_as_max=True, settings=s)
         p.spin_xy_pct.setValue(35000)
-        self.assertEqual(c.safety_limits.max_xy_speed, 35000.0)
+        # the declaration + SMS denominator + jog anchors, in one call
+        c.set_xy_top_speed_um_s.assert_called_once_with(35000.0)
+        # both persisted homes, not just the safety mirror
         self.assertEqual(s.get("safety_limits.max_xy_speed"), 35000.0)
+        self.assertEqual(s.get("device_profile.xy_max_speed_um_s"), 35000.0)
         self.assertTrue(c.notify_speed_limits_changed.called)
 
     # 4 — editing Z max routes through apply_device_settings (per_axis['Z'])

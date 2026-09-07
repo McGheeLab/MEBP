@@ -81,9 +81,16 @@ class TestVolumeScaling(unittest.TestCase):
         needle = NeedleSpec(gauge=22, od_um=718, id_um=413, wall_um=152)
         sk = _line_sketch(1.0)
         sk.line_spacing_mm = 0.72          # deliberately ≠ inner Ø — must NOT matter
+        # v7.21.5: 1× means "one reference bead wide", and the reference IS the
+        # inner Ø — so declare that width to measure the canonical area.
+        sk.shapes[0].line_width_mm = 0.413
         c = compile_to_trajectory(sk, needle, None)
         area = np.pi * (0.413 / 2) ** 2    # bore cross-section (mm²)
         self.assertAlmostEqual(c.total_volume_uL, 10.0 * area, places=4)
+        # …and twice that declared width deposits twice as much.
+        sk.shapes[0].line_width_mm = 0.826
+        c2 = compile_to_trajectory(sk, needle, None)
+        self.assertAlmostEqual(c2.total_volume_uL, 20.0 * area, places=4)
 
     def test_volume_independent_of_layer_height(self):
         # Canonical model ignores layer_height for volume (it is only the Z step

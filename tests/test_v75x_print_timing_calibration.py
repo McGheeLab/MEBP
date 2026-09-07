@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QApplication
 
 from SupportClasses.PrintTimingCalibrationStore import PrintTimingCalibrationStore
 import gui.pages.workflows.timing_calibration_workflow as tcw
+from SupportClasses import XYCalibrationRun as _CR
 from gui.pages.workflows.timing_calibration_workflow import (
     TimingCalibrationWorkflowPage, _TimingConfig, _fit_line,
 )
@@ -123,12 +124,12 @@ class TestRegistrationAndGate(_QtBase):
         page = TimingCalibrationWorkflowPage(_GateCtrl(), settings=None)
         self.assertEqual(page.get_page_title(), "XY↔ZP Timing Calibration")
         cfg = page._gather_config()
-        self.assertEqual(cfg.max_segments, 8)
+        self.assertGreater(cfg.top_max_dist_mm, 0)
 
     def test_refuses_without_safe_z(self):
         page = TimingCalibrationWorkflowPage(_GateCtrl(), settings=None)
         page._safe_z = None
-        page._on_start()
+        page._on_run_calibration()
         self.assertFalse(page._running())
         self.assertIn("Safe Z", page._status.text())
 
@@ -139,7 +140,7 @@ class TestRegistrationAndGate(_QtBase):
         page._safe_z = 5.0
         page._plate = object()                 # so center resolves
         page._detector_combo.setCurrentIndex(1)   # 'Microscope camera'
-        page._on_start()                       # camera_manager is None
+        page._on_run_calibration()             # camera_manager is None
         self.assertFalse(page._running())
         self.assertIn("microscope", page._status.text().lower())
 
@@ -251,60 +252,15 @@ class _FakeMotion:
 
 # ── 5. Worker sweep ───────────────────────────────────────────────────
 
-class TestWorkerSweep(_QtBase):
-    def test_sweep_measures_stores_and_fits(self):
-        ctrl = _SweepCtrl(settle_s=0.12)
-        page = TimingCalibrationWorkflowPage(
-            ctrl, settings=None, camera_manager=ctrl)
-        page._safe_z = 5.0
-        page._plate = object()
-        page._optical_cam_idx = 0
-        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
-        results = []
-        finished = []
-        page._bridge.result.connect(lambda d: results.append(d))
-        page._bridge.finished.connect(lambda ok, m: finished.append((ok, m)))
-        d = tempfile.mkdtemp()
-        store = PrintTimingCalibrationStore(Path(d) / "t.json")
-        # seg 1mm @ 20mm/s → seg_time 0.05s < settle 0.12s → backlog grows
-        cfg = _TimingConfig(max_segments=3, seg_len_mm=1.0, speed_mm_s=20.0,
-                            repeats=1, still_window_s=0.12)
-        with patch.object(tcw, "_FrameMotion", _FakeMotion), \
-                patch.object(tcw, "get_store", return_value=store), \
-                patch.object(tcw, "_LOG_DIR", Path(d) / "tl"):
-            page._run(cfg)
-        self.assertTrue(finished and finished[-1][0])      # finished ok
-        self.assertGreater(len(ctrl.moves), 0)
-        self.assertIn(5.0, ctrl.retracts)                  # retracted at end
-        self.assertTrue(results)                           # result emitted
-        pts = results[-1]["points"]
-        self.assertGreaterEqual(len(pts), 2)
-        # backlog → delay grows with N → positive slope
-        self.assertGreater(results[-1]["slope"], 0.0)
-        # phase model persisted
-        self.assertIsNotNone(store.get_phase(20.0, 1.0))
-
-    def test_stop_before_start(self):
-        ctrl = _SweepCtrl()
-        page = TimingCalibrationWorkflowPage(
-            ctrl, settings=None, camera_manager=ctrl)
-        page._safe_z = 5.0
-        page._plate = object()
-        page._optical_cam_idx = 0
-        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
-        page._stop.set()
-        finished = []
-        page._bridge.finished.connect(lambda ok, m: finished.append((ok, m)))
-        d = tempfile.mkdtemp()
-        store = PrintTimingCalibrationStore(Path(d) / "t.json")
-        cfg = _TimingConfig(max_segments=3, seg_len_mm=1.0, speed_mm_s=20.0,
-                            repeats=1, still_window_s=0.12)
-        with patch.object(tcw, "_FrameMotion", _FakeMotion), \
-                patch.object(tcw, "get_store", return_value=store), \
-                patch.object(tcw, "_LOG_DIR", Path(d) / "tl"):
-            page._run(cfg)
-        self.assertTrue(finished)
-        self.assertFalse(finished[-1][0])
+# v7.21.2: TestWorkerSweep DELETED, not renamed.
+#
+# It drove `page._run`, the segment settle-delay sweep, which measured the legacy
+# `by_phase` per-segment phase lag. That whole measurement is retired: the
+# purpose-measured command-to-motion dead time supersedes it (by_phase's own
+# entries on ME3B_01 included two physically impossible negatives), and the one
+# XY calibration measures dead time directly. Deleting the test with the feature
+# follows this repo's rule that a test whose contract no longer exists is removed
+# rather than kept limping.
 
 
 # ── 6. Detector robustness (duplicate skip + motion-first stillness) ──
@@ -384,17 +340,84 @@ class TestStartLocation(_QtBase):
 
 
 class TestTopSpeed(_QtBase):
-    def test_measures_stores_and_applies(self):
+    def test_measures_and_reaches_the_timing_store(self):
+        """v7.21.2 CONTRACT CHANGE: the measurement reaches the store again.
+
+        The hardware config (Hardware Setup → Device → XY Stage Calibration →
+        Max speed) is the authority; the tool measures, reports the value
+        against what is configured, and arms an explicit Apply. Silently
+        overwriting would demote that field to advisory — and a bad measurement
+        would quietly change how every mm/s command is scaled.
+        """
         ctrl = _SweepCtrl(settle_s=0.1, speed_mm_s=20.0)   # true top = 20 mm/s
         page = TimingCalibrationWorkflowPage(
             ctrl, settings=None, camera_manager=ctrl)
         page._safe_z = 5.0
         page._plate = object()
         page._optical_cam_idx = 0
-        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
+        page._detector_combo.setCurrentIndex(1)
         results = []
-        finished = []
         page._bridge.result.connect(lambda d: results.append(d))
+        d = tempfile.mkdtemp()
+        store = PrintTimingCalibrationStore(Path(d) / "t.json")
+        cfg = _TimingConfig(max_segments=3, seg_len_mm=1.0, speed_mm_s=20.0,
+                            repeats=1, still_window_s=0.12, top_max_dist_mm=4.0)
+        with patch.object(tcw, "_FrameMotion", _FakeMotion), \
+                patch.object(tcw, "get_store", return_value=store), \
+                patch.object(tcw, "_LOG_DIR", Path(d) / "tl"):
+            page._run_top_speed(cfg)
+
+        # The measurement is REPORTED …
+        self.assertTrue(results)
+        measured = results[-1].get("xy_top_speed_um_s")
+        self.assertIsNotNone(measured)
+        self.assertGreater(measured, 12000)     # in the right ballpark
+        self.assertLess(measured, 32000)
+        # v7.21.2: the timing store IS a legitimate home again — it is what
+        # `StageCharacteristics.from_store` and `measured_from_store` read, and its
+        # emptiness is what made the old one-click calibration abort in a loop. The
+        # authority question is settled by `commit_top_speed` writing ALL the homes
+        # together, not by starving this one.
+        self.assertIsNotNone(store.get_xy_max_speed_um_s(),
+                             "the measurement must reach the timing store, or the "
+                             "simulator models an unclamped stage")
+
+    def test_the_run_row_is_one_button(self):
+        """v7.21.2 CONTRACT CHANGE: the separate probe buttons are gone.
+
+        `test_apply_button_is_what_makes_it_authoritative` was DELETED rather than
+        renamed — the explicit Apply step no longer exists. The measurement is now
+        applied automatically as step 5 of the single calibration (guarded by a
+        sanity gate in `commit_top_speed`), because a calibration that measures the
+        top speed and then asks the operator to press a second button is exactly
+        the loop this change exists to remove.
+        """
+        page = TimingCalibrationWorkflowPage(_GateCtrl(), settings=None)
+        self.assertEqual(page._run_btn.text(), "Run XY Calibration")
+        self.assertFalse(page._run_btn.isHidden())
+        for gone in ("_start_btn", "_speed_btn", "_apply_speed_btn",
+                     "_comms_btn"):
+            self.assertFalse(
+                hasattr(page, gone),
+                f"{gone} must not exist — a hidden-but-present button still "
+                f"reads as a second way to run part of the calibration")
+        # The grid coarseness is the only knob on the row.
+        self.assertEqual(
+            [page._grid_combo.itemData(i)
+             for i in range(page._grid_combo.count())],
+            list(_CR.GRID_LEVEL_ORDER))
+        self.assertEqual(page._grid_level(), "medium")
+
+    def test_the_run_still_ends_retracted(self):
+        """Unchanged safety property: the needle is left at safe Z."""
+        ctrl = _SweepCtrl(settle_s=0.1, speed_mm_s=20.0)
+        page = TimingCalibrationWorkflowPage(
+            ctrl, settings=None, camera_manager=ctrl)
+        page._safe_z = 5.0
+        page._plate = object()
+        page._optical_cam_idx = 0
+        page._detector_combo.setCurrentIndex(1)
+        finished = []
         page._bridge.finished.connect(lambda ok, m: finished.append((ok, m)))
         d = tempfile.mkdtemp()
         store = PrintTimingCalibrationStore(Path(d) / "t.json")
@@ -405,14 +428,7 @@ class TestTopSpeed(_QtBase):
                 patch.object(tcw, "_LOG_DIR", Path(d) / "tl"):
             page._run_top_speed(cfg)
         self.assertTrue(finished and finished[-1][0])
-        self.assertTrue(results)
-        # recovered top speed ≈ 20 mm/s → 20000 µm/s (tolerant — frame timing)
-        stored = store.get_xy_max_speed_um_s()
-        self.assertIsNotNone(stored)
-        self.assertGreater(stored, 12000)               # in the right ballpark
-        self.assertLess(stored, 32000)
-        self.assertIsNotNone(ctrl.xy_max_set)           # applied to the stage
-        self.assertIn(5.0, ctrl.retracts)               # retracted at end
+        self.assertIn(5.0, ctrl.retracts)
 
 
 if __name__ == "__main__":
