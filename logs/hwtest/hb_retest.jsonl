@@ -1,0 +1,24 @@
+{"ev": "start", "T": 21.62, "B": 21.43, "duty": 0, "wall": "19:02:38"}
+{"ev": "sample", "stage": "ctrl", "t": 0.0, "T": 21.62, "B": 21.43, "duty": 0, "wall": "19:02:38"}
+{"ev": "sample", "stage": "ctrl", "t": 0.51, "T": 21.84, "B": 21.35, "duty": 0, "wall": "19:02:38"}
+{"ev": "sample", "stage": "ctrl", "t": 1.01, "T": 21.45, "B": 21.45, "duty": 0, "wall": "19:02:39"}
+{"ev": "sample", "stage": "ctrl", "t": 1.52, "T": 21.74, "B": 21.64, "duty": 0, "wall": "19:02:39"}
+{"ev": "sample", "stage": "ctrl", "t": 2.02, "T": 21.82, "B": 21.46, "duty": 0, "wall": "19:02:40"}
+{"ev": "sample", "stage": "ctrl", "t": 2.53, "T": 21.19, "B": 21.29, "duty": 0, "wall": "19:02:40"}
+{"ev": "sample", "stage": "ctrl", "t": 3.04, "T": 21.64, "B": 21.35, "duty": 0, "wall": "19:02:41"}
+{"ev": "sample", "stage": "ctrl", "t": 3.54, "T": 21.45, "B": 21.29, "duty": 0, "wall": "19:02:41"}
+{"ev": "sample", "stage": "ctrl", "t": 4.05, "T": 21.48, "B": 21.74, "duty": 0, "wall": "19:02:42"}
+{"ev": "sample", "stage": "ctrl", "t": 4.58, "T": 21.7, "B": 20.84, "duty": 0, "wall": "19:02:42"}
+{"ev": "sample", "stage": "ctrl", "t": 5.08, "T": 21.78, "B": 21.11, "duty": 0, "wall": "19:02:43"}
+{"ev": "sample", "stage": "ctrl", "t": 5.61, "T": 21.7, "B": 21.54, "duty": 0, "wall": "19:02:43"}
+{"ev": "sample", "stage": "ctrl", "t": 6.12, "T": 21.97, "B": 21.05, "duty": 0, "wall": "19:02:44"}
+{"ev": "sample", "stage": "ctrl", "t": 6.63, "T": 21.58, "B": 21.27, "duty": 0, "wall": "19:02:44"}
+{"ev": "sample", "stage": "ctrl", "t": 7.14, "T": 21.33, "B": 21.48, "duty": 0, "wall": "19:02:45"}
+{"ev": "sample", "stage": "ctrl", "t": 7.66, "T": 21.39, "B": 21.46, "duty": 0, "wall": "19:02:46"}
+{"ev": "sample", "stage": "ctrl", "t": 8.16, "T": 21.56, "B": 21.54, "duty": 0, "wall": "19:02:46"}
+{"ev": "sample", "stage": "ctrl", "t": 8.67, "T": 21.86, "B": 21.64, "duty": 0, "wall": "19:02:47"}
+{"ev": "sample", "stage": "ctrl", "t": 9.17, "T": 22.01, "B": 21.46, "duty": 0, "wall": "19:02:47"}
+{"ev": "sample", "stage": "ctrl", "t": 9.68, "T": 21.66, "B": 21.27, "duty": 0, "wall": "19:02:48"}
+{"ev": "sample", "stage": "hold", "t": 0.0, "T": 21.64, "B": 21.46, "duty": 0, "wall": "19:02:48"}
+{"ev": "port_died", "stage": "hold", "t": 1.0048504000296816, "wall": "19:02:49"}
+{"ev": "end", "verdict": "port_died", "wall": "19:02:49"}

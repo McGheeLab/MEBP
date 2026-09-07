@@ -519,6 +519,22 @@ class TestSetpointKeeper(_SimControllerTest):
         self.ctrl.submit = lambda fn, *a, **k: sent.append((fn, a, k))
         return rt, sent
 
+    @staticmethod
+    def _setpoint_cmds(sent):
+        """Only the re-asserted SETPOINT commands.
+
+        A detected reset now also re-asserts the PID gains (a Marlin reset
+        clears those too), so `sent` legitimately carries a second entry per
+        reset. Counting raw submissions would conflate the two.
+        """
+        return [e for e in sent if getattr(e[0], "__name__", "")
+                == "_send_zone_cmd"]
+
+    @staticmethod
+    def _pid_reapplies(sent):
+        return [e for e in sent if getattr(e[0], "__name__", "")
+                == "_do_apply_configured_pid"]
+
     def test_the_board_forgetting_its_target_is_put_back(self):
         rt, sent = self._arm(board_target=0.0)
         msgs = []
@@ -528,8 +544,9 @@ class TestSetpointKeeper(_SimControllerTest):
             self.ctrl._service_setpoint_keeper()   # sample 1: debounce
             self.assertEqual([], sent, "one disagreeing sample must not act")
             self.ctrl._service_setpoint_keeper()   # sample 2: act
-        self.assertEqual(1, len(sent), "the setpoint was never re-asserted")
-        _fn, args, _kw = sent[0]
+        cmds = self._setpoint_cmds(sent)
+        self.assertEqual(1, len(cmds), "the setpoint was never re-asserted")
+        _fn, args, _kw = cmds[0]
         self.assertEqual("bed", args[0])
         self.assertEqual("M140 S37", args[1])
         self.assertEqual(1, rt.reasserts)
@@ -644,7 +661,7 @@ class TestSetpointKeeper(_SimControllerTest):
         said = sum(1 for m in msgs if "forgotten its setpoint" in m)
         self.assertEqual(3, said,
                          f"expected 3 spoken warnings, got {said}")
-        self.assertEqual(rt.reasserts, len(sent),
+        self.assertEqual(rt.reasserts, len(self._setpoint_cmds(sent)),
                          "every re-assert must actually reach the board")
 
 

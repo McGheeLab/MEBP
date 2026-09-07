@@ -58,8 +58,11 @@ from SupportClasses.incubator.service import (
     connect_from_store, get_incubator, make_exclusion_provider,
     make_poll_gate, make_zp_getter,
 )
+from SupportClasses.incubator.power_staircase import (
+    plan_staircase, verdict_lines,
+)
 from SupportClasses.incubator.stability import format_duration
-from SupportClasses.incubator.zones import ALL_ZONES
+from SupportClasses.incubator.zones import ALL_ZONES, zone_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -257,10 +260,20 @@ class IncubatorWorkflowPage(QWidget):
         return box
 
     def _build_upper(self) -> QWidget:
-        wrap = QWidget()
-        lay = QHBoxLayout(wrap)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(s(10))
+        """Zone cards | (trend over sensor table), every boundary draggable.
+
+        Both dividers are splitters rather than fixed sizes because the
+        right-hand column used to swallow every spare pixel — on a wide
+        screen that rendered the trend as a very wide, very short strip
+        (operator: *"too wide … it needs to be resizable"*). The horizontal
+        divider hands that width back to the zone cards; the vertical one
+        trades plot height against the sensor table, which could not grow
+        at all before (it was pinned to a fixed height).
+        """
+        wrap = QSplitter(Qt.Horizontal)
+        # Collapsing a pane to zero leaves a control surface the operator
+        # cannot get back without knowing where the handle is.
+        wrap.setChildrenCollapsible(False)
 
         cards = QWidget()
         cl = QVBoxLayout(cards)
@@ -284,13 +297,12 @@ class IncubatorWorkflowPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setFixedWidth(s(372))
-        lay.addWidget(scroll)
+        # Was a FIXED width; now a floor, so the splitter can widen it.
+        scroll.setMinimumWidth(s(372))
+        wrap.addWidget(scroll)
 
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(s(8))
+        right = QSplitter(Qt.Vertical)
+        right.setChildrenCollapsible(False)
 
         trend = QGroupBox("Temperature trend")
         tl = QVBoxLayout(trend)
@@ -320,7 +332,7 @@ class IncubatorWorkflowPage(QWidget):
         tl.addLayout(ctlrow)
         self._plot = TempTrendPlot()
         tl.addWidget(self._plot, 1)
-        rl.addWidget(trend, 1)
+        right.addWidget(trend)
 
         sensors = QGroupBox("Sensor channels")
         sl = QVBoxLayout(sensors)
@@ -347,15 +359,23 @@ class IncubatorWorkflowPage(QWidget):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.NoSelection)
         self._table.setAlternatingRowColors(True)
-        self._table.setFixedHeight(s(124))
+        # Was FIXED; a floor instead, so dragging the divider down actually
+        # shows more rows rather than leaving the extra height empty.
+        self._table.setMinimumHeight(s(124))
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         for _col in range(1, 6):
             hdr.setSectionResizeMode(_col, QHeaderView.ResizeToContents)
         sl.addWidget(self._table)
-        rl.addWidget(sensors)
+        right.addWidget(sensors)
+        right.setStretchFactor(0, 3)   # extra height goes to the plot
+        right.setStretchFactor(1, 0)
+        right.setSizes([s(360), s(170)])
 
-        lay.addWidget(right, 1)
+        wrap.addWidget(right)
+        wrap.setStretchFactor(0, 0)
+        wrap.setStretchFactor(1, 1)
+        wrap.setSizes([s(372), s(720)])
         return wrap
 
     def _build_lower(self) -> QWidget:
@@ -363,6 +383,7 @@ class IncubatorWorkflowPage(QWidget):
         tabs.addTab(self._build_health_tab(), "Stability && health")
         tabs.addTab(self._build_pid_tab(), "PID")
         tabs.addTab(self._build_autotune_tab(), "Autotune")
+        tabs.addTab(self._build_staircase_tab(), "Power staircase")
         tabs.addTab(self._build_calibration_tab(), "Sensor calibration")
         tabs.addTab(self._build_firmware_tab(), "Firmware")
         tabs.addTab(self._build_console_tab(), "Console")
@@ -565,6 +586,203 @@ class IncubatorWorkflowPage(QWidget):
         lay.addWidget(self._at_adopt)
         return w
 
+    def _build_staircase_tab(self) -> QWidget:
+        """Round 6: how much bed power can this rig actually carry?
+
+        Bench 2026-08-17: the board leaves USB 0.45 s after ``M140 S37``,
+        four attempts out of four, and never once with the heater off. The
+        command path is fine and the bed heats — the question is the power
+        level the link survives. Same engine as
+        ``tools_incubator_heater_diagnostic.py --staircase``; this runs it
+        in-app, over whatever transport is live.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        info = QLabel(
+            "Steps the heater power up a rung at a time and reports the "
+            "highest level the link survives. Use it when the board drops "
+            "off USB as the heater starts, rather than failing to heat.\n"
+            "Peak-limited holds Marlin's own duty down (pure-P bed PID, "
+            "restored afterwards, never saved to EEPROM). Average-limited "
+            "gates full-power bursts on and off — every burst is full "
+            "current. If peak-limited survives where average-limited dies, "
+            "the fault is inrush current."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{_hex('overlay0', '#6c7086')};")
+        lay.addWidget(info)
+
+        self._sc_warn = QLabel(
+            "⚠ This test is EXPECTED to reset the board when it finds the "
+            "level the supply cannot carry — that is the measurement. On the "
+            "shared link that same board runs Z and the pumps, so retract "
+            "the needle first and expect to re-declare the Z position "
+            "afterwards. It refuses to start while a print is running."
+        )
+        self._sc_warn.setWordWrap(True)
+        self._sc_warn.setStyleSheet(
+            f"color:{_hex('yellow', '#f9e2af')};font-size:{sf(8.5)}pt;")
+        lay.addWidget(self._sc_warn)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Zone"))
+        self._sc_zone = QComboBox()
+        for spec in ALL_ZONES:
+            self._sc_zone.addItem(spec.title, spec.zone_id)
+        row.addWidget(self._sc_zone)
+
+        row.addWidget(QLabel("Mode"))
+        self._sc_mode = QComboBox()
+        self._sc_mode.addItem("Peak-limited (PID)", "pid")
+        self._sc_mode.addItem("Average-limited (slow PWM)", "pwm")
+        self._sc_mode.setToolTip(
+            "Peak-limited reduces the current the supply ever sees.\n"
+            "Average-limited keeps full-current bursts and reduces only the "
+            "average — the pair separates inrush from capacity.")
+        row.addWidget(self._sc_mode)
+
+        row.addWidget(QLabel("Rungs %"))
+        self._sc_rungs = QLineEdit("10,25,50,75,100")
+        self._sc_rungs.setMaximumWidth(s(150))
+        self._sc_rungs.setToolTip(
+            "Percentages of full heater power, tried in ascending order.")
+        row.addWidget(self._sc_rungs)
+
+        row.addWidget(QLabel("s/rung"))
+        self._sc_seconds = QDoubleSpinBox()
+        self._sc_seconds.setRange(2.0, 120.0)
+        self._sc_seconds.setValue(12.0)
+        self._sc_seconds.setDecimals(0)
+        row.addWidget(self._sc_seconds)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Ceiling"))
+        self._sc_ceiling = QDoubleSpinBox()
+        self._sc_ceiling.setRange(1.0, float(self.ctrl.MAX_SETPOINT_C))
+        self._sc_ceiling.setValue(min(45.0, float(self.ctrl.MAX_SETPOINT_C)))
+        self._sc_ceiling.setSuffix(" °C")
+        self._sc_ceiling.setToolTip(
+            "The target the rungs drive against. It needs headroom above the "
+            "current temperature or the firmware has no error to drive and "
+            "every rung reads 0%.")
+        row2.addWidget(self._sc_ceiling)
+
+        row2.addWidget(QLabel("Abort above"))
+        self._sc_abort = QDoubleSpinBox()
+        self._sc_abort.setRange(1.0, 95.0)
+        self._sc_abort.setValue(45.0)
+        self._sc_abort.setSuffix(" °C")
+        row2.addWidget(self._sc_abort)
+
+        self._sc_start = QPushButton("Run staircase")
+        self._sc_start.setObjectName("primaryButton")
+        self._sc_start.clicked.connect(self._on_staircase_start)
+        row2.addWidget(self._sc_start)
+        self._sc_stop = QPushButton("Stop")
+        self._sc_stop.setEnabled(False)
+        self._sc_stop.clicked.connect(self.ctrl.cancel_power_staircase)
+        row2.addWidget(self._sc_stop)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
+        self._sc_log = QPlainTextEdit()
+        self._sc_log.setReadOnly(True)
+        self._sc_log.setMaximumBlockCount(3000)
+        self._sc_log.setFont(mono_font(scaled_font_size(9)))
+        self._sc_log.setPlaceholderText(
+            "Results appear here — the same report the bench tool prints.")
+        lay.addWidget(self._sc_log, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        copy = QPushButton("Copy report")
+        copy.clicked.connect(self._on_staircase_copy)
+        btns.addWidget(copy)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self._sc_log.clear)
+        btns.addWidget(clear)
+        lay.addLayout(btns)
+        return w
+
+    def _on_staircase_start(self) -> None:
+        zone_id = self._sc_zone.currentData()
+        spec = zone_by_id(zone_id)
+        mode = self._sc_mode.currentData()
+        try:
+            rungs = plan_staircase(self._sc_rungs.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Rungs", str(e))
+            return
+
+        # Naming the consequence, not just asking. The board this resets is
+        # the motion board on the shared link.
+        shared = self.ctrl.shared_transport
+        msg = (
+            f"Run a power staircase on {spec.title}?\n\n"
+            f"Rungs: {rungs} % of full power, "
+            f"{self._sc_seconds.value():.0f}s each\n"
+            f"Mode: {self._sc_mode.currentText()}\n"
+            f"Ceiling {self._sc_ceiling.value():.0f} °C, aborts above "
+            f"{self._sc_abort.value():.0f} °C\n\n"
+            f"This is EXPECTED to reset the board when it reaches a level "
+            f"the supply cannot carry — that is the measurement."
+        )
+        if shared:
+            msg += (
+                "\n\nThat board also runs Z and the pumps. Retract the needle "
+                "first; after a reset the Z position must be re-declared."
+            )
+        if mode == "pid":
+            msg += ("\n\nThe bed PID is temporarily set to pure proportional "
+                    "and put back afterwards. Nothing is saved to EEPROM.")
+        if QMessageBox.question(
+                self, "Power staircase", msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        self._sc_log.appendPlainText(
+            f"=== staircase: {spec.title}, {mode}, rungs {rungs}, "
+            f"{self._sc_seconds.value():.0f}s each, ceiling "
+            f"{self._sc_ceiling.value():.0f} C ===")
+        self._sc_log.appendPlainText(
+            "  rung   t(s)   sensor C   target   duty   %power")
+        started = self.ctrl.start_power_staircase(
+            zone_id, rungs=rungs, rung_seconds=self._sc_seconds.value(),
+            ceiling_c=self._sc_ceiling.value(),
+            abort_above_c=self._sc_abort.value(), mode=mode,
+        )
+        if not started:
+            # start_power_staircase already published WHY on the status line.
+            self._sc_log.appendPlainText("  (refused — see the status line)")
+            return
+        self._sc_start.setEnabled(False)
+        self._sc_stop.setEnabled(True)
+
+    def _on_staircase_row(self, row: dict) -> None:
+        tgt = row.get("target_c")
+        self._sc_log.appendPlainText(
+            f"  {row['pct']:4d}   {row['elapsed_s']:4.1f}   "
+            f"{row['temp_c']:8.2f}   "
+            f"{(f'{tgt:6.1f}' if tgt is not None else '     ?')}   "
+            f"{row['duty']:4d}   {row['duty_pct']:5.0f}%")
+
+    def _on_staircase_done(self, zone_id: str, outcome) -> None:
+        self._sc_start.setEnabled(True)
+        self._sc_stop.setEnabled(False)
+        self._sc_log.appendPlainText("")
+        self._sc_log.appendPlainText("--- VERDICT ---")
+        for line in verdict_lines(outcome):
+            self._sc_log.appendPlainText("  " + line if line else "")
+        self._sc_log.appendPlainText("")
+
+    def _on_staircase_copy(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._sc_log.toPlainText())
+        self._status.setText("Staircase report copied to the clipboard.")
+
     def _build_calibration_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -691,6 +909,8 @@ class IncubatorWorkflowPage(QWidget):
         b.probe_done.connect(self._on_probe)
         b.status.connect(self._on_status)
         b.ramp.connect(self._on_ramp)
+        b.staircase_row.connect(self._on_staircase_row)
+        b.staircase_done.connect(self._on_staircase_done)
 
     # ── store preferences ───────────────────────────────────────────
 

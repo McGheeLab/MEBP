@@ -1,0 +1,11 @@
+baseline  T 21.07  B 21.45
+M104 S37 -> ['//action:notification Ender-3 Ready.', 'ok']
+
+  t=   0.0s  T  21.07 (+0.00)  B  21.45 (+0.00)  duty   0/127
+  t=   5.0s  T  21.29 (+0.22)  B  22.07 (+0.62)  duty 127/127
+  t=  10.1s  T  21.35 (+0.28)  B  22.77 (+1.32)  duty 127/127
+  t=  15.1s  T  21.39 (+0.32)  B  24.22 (+2.77)  duty 127/127
+*** BOARD FAULT at 20.1s: ['echo:Heating Failed', 'Error:Printer halted. kill() called!']
+
+heater off: []
+VERDICT: fault after 56.3s

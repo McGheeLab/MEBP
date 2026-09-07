@@ -101,6 +101,8 @@ class HeaterBridge(QObject):
     probe_done = Signal(object)
     status = Signal(str)
     ramp = Signal(str, object)
+    staircase_row = Signal(object)          # one sampled row, ~1 Hz
+    staircase_done = Signal(str, object)    # zone_id, StaircaseOutcome
 
     def attach(self, ctrl) -> None:
         ctrl.on_channels(self.channels.emit)
@@ -117,6 +119,11 @@ class HeaterBridge(QObject):
         ctrl.on_probe(self.probe_done.emit)
         ctrl.on_status(self.status.emit)
         ctrl.on_ramp(self.ramp.emit)
+        # Round 6: these fire from the staircase's OWN thread, so they must
+        # cross into Qt the same way everything else here does.
+        if hasattr(ctrl, "on_staircase_row"):
+            ctrl.on_staircase_row(self.staircase_row.emit)
+            ctrl.on_staircase_done(self.staircase_done.emit)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -226,6 +233,10 @@ class TempTrendPlot(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumHeight(s(230))
+        # A floor on BOTH axes: the plot now lives between splitter handles
+        # (the page's upper area), and the axis labels/gridlines stop being
+        # readable well before a dragged pane reaches zero.
+        self.setMinimumWidth(s(300))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._window_s = 900.0
         self._series: dict[str, deque] = {}
@@ -604,6 +615,45 @@ class ZoneCard(QGroupBox):
         self._sp.setValue(value)
         self._on_set()
 
+    def _ask_watchdog(self, plan: dict, chk) -> str:
+        """Offer the Ramp instead of a setpoint that will arm the watchdog.
+
+        Returns "ramp", "set" or "cancel". Separated from :meth:`_on_set` so
+        it is one overridable seam rather than a bare modal: offscreen a
+        modal blocks forever, so a hidden one turns every future test that
+        presses Set into a hang.
+        """
+        gap = plan.get("watchdog_arm_gap_c", 6.0)
+        cur = plan.get("current_c")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Heat-up watchdog")
+        box.setText(
+            f"Setting {self.title()} straight to {chk.allowed_c:g} °C"
+            + (f" from {cur:.1f} °C" if cur is not None else "")
+            + " will arm Marlin's heat-up watchdog."
+        )
+        box.setInformativeText(
+            "The firmware then demands a fast rise, and halts the board with "
+            "\"Heating Failed\" if this heater cannot deliver it. On the "
+            "shared link that stops Z and the pumps too."
+            + chr(10) + chr(10) +
+            f"The Ramp walks the setpoint up in steps smaller than "
+            f"{gap:.0f} °C, so the watchdog never arms — the heater still "
+            f"runs at full power throughout."
+        )
+        use_ramp = box.addButton("Use Ramp", QMessageBox.AcceptRole)
+        set_anyway = box.addButton("Set anyway", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(use_ramp)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is use_ramp:
+            return "ramp"
+        if clicked is set_anyway:
+            return "set"
+        return "cancel"
+
     def _on_set(self) -> None:
         if not self._ctrl.connected:
             QMessageBox.information(self, "Not connected",
@@ -611,6 +661,22 @@ class ZoneCard(QGroupBox):
             return
         plan = self._ctrl.preview_setpoint(self._spec.zone_id, self._sp.value())
         chk = plan["check"]
+
+        # v7.18 round 6c: a direct setpoint far above the current temperature
+        # ARMS Marlin's heat-up watchdog, and on a slow thermal load that ends
+        # in "Heating Failed" -> kill(): the board halts and, on the shared
+        # link, takes Z and the pumps with it. Bench 2026-08-17: M140 S37 from
+        # ~21 C killed the board at 60 s on BOTH boards. The Ramp exists for
+        # exactly this, so offer it rather than either silently converting the
+        # press (that would change what the button means) or letting a known
+        # board-killer through unremarked.
+        if plan.get("watchdog_risk"):
+            choice = self._ask_watchdog(plan, chk)
+            if choice == "ramp":
+                self._on_ramp_clicked()
+                return
+            if choice != "set":
+                return
 
         if chk.clamped or chk.needs_confirm:
             msg = [f"Set {self.title()} to {chk.allowed_c:g} °C?"]

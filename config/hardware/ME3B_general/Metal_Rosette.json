@@ -1,0 +1,230 @@
+{
+  "version": "7.3.0",
+  "config_name": "Metal_Rosette",
+  "notes": "",
+  "needle": {
+    "gauge": null,
+    "od_um": 1000.0,
+    "id_um": 500.0,
+    "wall_um": 250.0,
+    "length_inches": 2.952755905511811,
+    "num_channels": 1,
+    "channel_pump_map": {
+      "1": "P1"
+    },
+    "needle_type": "pulled_capillary",
+    "tip_id_um": 150.0,
+    "tip_length_mm": 5.0,
+    "tip_od_um": 500.0,
+    "needle_type_id": "pulled_preset1_boro.",
+    "tip_profile": "cone"
+  },
+  "pumps": {
+    "P1": {
+      "pump_id": "P1",
+      "syringe_volume_uL": 100,
+      "syringe": {
+        "volume_uL": 100,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 2.06,
+        "part_number": "1710"
+      },
+      "inks": [
+        {
+          "name": "LLS rhodamine",
+          "ink_type": "ink",
+          "ink_subtype": "",
+          "viscosity_cP": 1.0,
+          "granule_diameter_um": 50.0,
+          "cell_diameter_um": 0.0,
+          "density_g_mL": 1.0,
+          "color": "#550000"
+        },
+        {
+          "name": "Inert",
+          "ink_type": "ink",
+          "ink_subtype": "",
+          "viscosity_cP": 1.0,
+          "granule_diameter_um": 0.5,
+          "cell_diameter_um": 0.0,
+          "density_g_mL": 1.0,
+          "color": "#00ffff"
+        }
+      ],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": true
+    },
+    "P2": {
+      "pump_id": "P2",
+      "syringe_volume_uL": 250,
+      "syringe": {
+        "volume_uL": 250,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 3.256,
+        "part_number": "1725"
+      },
+      "inks": [],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": false
+    },
+    "P3": {
+      "pump_id": "P3",
+      "syringe_volume_uL": null,
+      "syringe": null,
+      "inks": [],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": false
+    }
+  },
+  "pump_settle_time_s": 0.0,
+  "pump_prime_time_s": 0.25,
+  "gentle_z_slow_dist_mm": 1.0,
+  "gentle_z_slow_speed_mm_s": 1.0,
+  "plate_format": 12,
+  "plate_name": "Custom 6 insert with rosette",
+  "plate_type_id": "",
+  "plate_doc_id": "plt_7863c425dc27",
+  "ink_library": {
+    "Silicon Oil": {
+      "name": "Silicon Oil",
+      "ink_type": "oil",
+      "ink_subtype": "",
+      "viscosity_cP": 10.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#ffff7f"
+    },
+    "Wash Water": {
+      "name": "Wash Water",
+      "ink_type": "wash",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#0055ff"
+    },
+    "Waste Water": {
+      "name": "Waste Water",
+      "ink_type": "waste",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#a6e3a1"
+    },
+    "LLS rhodamine": {
+      "name": "LLS rhodamine",
+      "ink_type": "ink",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 50.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#550000"
+    },
+    "Inert": {
+      "name": "Inert",
+      "ink_type": "ink",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.5,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#00ffff"
+    }
+  },
+  "ink_locations": {
+    "LLS rhodamine": [
+      "A4.Ro3"
+    ],
+    "Inert": [
+      "A4.Ro2"
+    ],
+    "Silicon Oil": [
+      "A4.Ro1"
+    ],
+    "Wash Water": [
+      "A5"
+    ],
+    "Waste Water": [
+      "A6"
+    ]
+  },
+  "rosette_library": {},
+  "buffer_ink_name": "DPBS",
+  "needle_channel_pump_map": {
+    "0": "P1"
+  },
+  "ink_swap_strategy": {
+    "waste": true,
+    "wash_pre": true,
+    "buffer": true,
+    "wash_post": true,
+    "ink_load": true,
+    "wash_final": true,
+    "waste_volume_uL": 50.0,
+    "wash_volume_uL": 100.0,
+    "buffer_volume_uL": 100.0,
+    "ink_load_volume_uL": 50.0
+  },
+  "camera_config": {
+    "camera_spec": {
+      "name": "Tucsen Libra 25 (TUCam)",
+      "sensor_pixel_size_um": null,
+      "max_resolution": [
+        5200,
+        4096
+      ],
+      "preview_resolutions": [
+        [
+          2600,
+          2048
+        ],
+        [
+          5200,
+          4096
+        ]
+      ],
+      "interface": "USB 3.0",
+      "notes": "Hardware-verified on this rig: USB\\VID_5453&PID_E437, driver TUUSB3, mono 16-bit. Capability 0 RESOLUTION = [0 = 5200x4096 'Resolution', 1 = 2600x2048 'Sensitive']; 'Sensitive' is 2x2 binning, so it does NOT change the field of view. 2600x2048 is listed FIRST because that is what the preview auto-selects. sensor_pixel_size_um is null ON PURPOSE: the pitch is not published in anything verifiable here, and a guessed value would show as a plausible 'theoretical um/px' that a real calibration is then judged against. Measure it with Mosaic & Camera Calibration; see gui/widgets/tucam_backend.py."
+    },
+    "objective_magnification": 4.0,
+    "active_resolution": [
+      2600,
+      2048
+    ],
+    "micron_per_pixel_override": null,
+    "camera_to_needle_offset_um": [
+      0.0,
+      0.0
+    ],
+    "current_objective_name": "4x"
+  },
+  "camera_roles": [
+    "microscope",
+    "needle_x",
+    "needle_y",
+    "unassigned"
+  ]
+}

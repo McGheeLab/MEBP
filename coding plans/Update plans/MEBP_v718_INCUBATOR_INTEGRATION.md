@@ -227,6 +227,320 @@ test_no_z_max_keeps_defaults` (both documented in CLAUDE.md), and
 
 ## Issues & Decisions
 
+- **⭐ ROUND 6d — BOARD REPLACED, AND THE ONE SOFTWARE GAP IT LEFT.**
+  The replacement SKR Mini E3 V3 (COM3, serial `2061328F4231`) settles round
+  6c: **the identical test that killed the old board in 1.00 s ran 59.4 s at
+  duty 127/127 with zero link drops.** The operator confirms the pads now
+  heat. Diagnosis closed — the fault was the old board's bed output.
+
+  **What that left is a firmware/UX gap, not an electrical one.** Both boards
+  halted with `Heating Failed` -> `kill()` when a setpoint was commanded far
+  above the current temperature, because Marlin arms its heat-up watchdog and
+  a slow thermal load cannot satisfy it. `ramp.py` already derives the exact
+  arm threshold FROM MARLIN'S OWN SOURCE (`HeaterWatch::restart`: the watch
+  is only scheduled above `current + INCREASE + HYSTERESIS + 1`, ~6 C) — and
+  **`watchdog_arm_threshold_c()` had ZERO production callers**, the dead-
+  function trap this file keeps recording. So the Ramp button was safe and
+  the Set button beside it was a board-killer, with nothing saying so.
+  `preview_setpoint` now reports `watchdog_risk` / `watchdog_arm_gap_c` /
+  `current_c` (additive — every existing key untouched, pinned), judged
+  **only from a live reading**: a risk we cannot substantiate would train the
+  operator to click through the warning. The zone card offers the Ramp
+  (default) / Set anyway / Cancel.
+
+  ⚠ **The offer is ONE overridable seam (`ZoneCard._ask_watchdog`), not a
+  bare modal** — and that is not tidiness: the first cut put a
+  `QMessageBox(...).exec()` straight into `_on_set` and **hung an existing
+  test**, because offscreen a modal blocks forever and this suite patches
+  only `QMessageBox.question`. A hidden modal turns every future test that
+  presses Set into a hang; an AST test now pins both that `_on_set` asks
+  through the seam and that it opens no modal itself.
+  `test_set_target_through_the_card_with_confirm` was updated for the
+  genuinely-changed contract (it takes "Set anyway", since it is about the
+  direct set).
+
+  🐞 **A cancel now outranks a teardown failure.** A staircase cancelled
+  mid-rung could report `died_at=("dropped", "'M140 S0' not accepted")` —
+  the command failed *because* we were stopping, and blaming the board for
+  the operator's own cancel is a false diagnosis. Surfaced as an
+  intermittent test failure and fixed at all three failure sites.
+  ⚠ Two suite-interaction flakes disclosed and fixed in the TESTS, not by
+  weakening them: late in a full run the simulated link can take the full 8 s
+  transaction timeout, which exceeded a 3 s rung, so no sample was ever
+  published — the window was widened, the assertion is unchanged (3/3 in
+  isolation before, 2/2 full-suite repeats after).
+
+  Regression: staircase-in-app 32 · incubator GUI 37 · backend 44 · staircase
+  33 · shared link 33 · hygiene 10, all green per suite, plus a `gui.app`
+  import smoke; **3/3 mutations CAUGHT** (risk never reported = the board
+  killer goes through unremarked · risk claimed without a live reading ·
+  threshold ignored so every setpoint warns).
+
+  **Still open, and hardware not software:** the pad gained only 2.7 C/min at
+  28 C at FULL duty during the HE0 soak and had not reached 37 C — whether
+  this heater can hold 37 C in the real enclosure is a power/insulation
+  question independent of everything above.
+
+- **🔴🔴 ROUND 6c — BENCH 2026-08-17 EVENING: THE FAULT IS THE BOARD'S BED
+  OUTPUT, PROVED BY A CONTROLLED SUBSTITUTION.** Driven directly over COM4
+  with MEBP closed, so the app, the ZP poller and the shared link were all
+  out of the picture. **The control experiment is the whole argument:** a
+  target BELOW ambient is accepted by Marlin but never switches the MOSFET,
+  a target ABOVE ambient does — same command, same code path, same load,
+  and only the switching differs.
+
+  | test | MOSFET switches? | result |
+  |---|---|---|
+  | HB `M140 S10` | no | survives indefinitely, duty 0 |
+  | HB `M140 S37` | yes | **port dies in 1.00 s** |
+  | HE0 `M104 S37` | yes | **survives 60 s at duty 127**, +6.2 C |
+
+  So: the command path is innocent (the board takes `M140` and runs), the
+  **pad** is good (4 ohm; +10.5 C/min on HE0), and the **supply** is good
+  (it carried the identical ~3 A on HE0 for a minute — measured heating
+  rates HB +11.8 vs HE0 +10.5 C/min over comparable windows, i.e. the same
+  load). What remains is the HB output itself: fine at rest, collapsing the
+  12 V rail within ~4 ms of being driven. It degraded across the day —
+  18 s of carrying the load in the morning, then failure at 3 % duty, then
+  at 1 s — and **an unplug/replug did not fix it**, ruling out a loose
+  terminal. Board replaced.
+
+  ⚠ **A DUTY LEVEL CANNOT HELP, and my own round-6 rationale was WRONG
+  about why.** Marlin's bed heating is TIME-PROPORTIONED soft PWM: the
+  MOSFET is fully ON during each pulse, so the peak current at 3 % is
+  identical to 100 % and only the pulse WIDTH changes. The staircase died
+  at the 5 % rung — one ~4 ms full-current pulse was already too much. The
+  "pid mode limits PEAK current" claim is corrected in
+  `power_staircase.py`, and the verdict now says so.
+
+  ⚠ **`@:`/`B@:` IS NOT EVIDENCE OF CURRENT** — the second correction, and
+  it came from a real mistake: three HE0 runs were made with the heater
+  UNPLUGGED (the operator said so afterwards), and Marlin reported duty
+  **127/127 for 20 s** into that open circuit, with no heat and no sag. The
+  staircase would have printed *"survived 100%"* — telling the operator
+  their supply carries full power when nothing was connected, the exact
+  false-all-clear class already guarded on the other side. NEW
+  `rung_open_circuit()` (sustained high duty + no temperature rise) fills a
+  NEW `StaircaseOutcome.no_heat`, wired into BOTH the bench tool and the
+  controller (a pure check nothing populates is the dead-field trap), and
+  the verdict leads with **"NOTHING WAS DRAWING … the link was never
+  loaded"**. Pinned by a fake that reports full duty and delivers no heat.
+
+  ⚠ **THE HOTEND CHANNEL IS THE WRONG HOME FOR A SLOW LOAD, and that is
+  firmware, not electrical.** With the pad on HE0 and the probe moved to
+  THO the board was rock solid at full duty — and Marlin still called
+  `Heating Failed` / `kill()` at 60 s, because its hotend heat-up watchdog
+  wants +2 C per 20 s and this pad delivered +3.59 / +1.86 / +0.91 across
+  three successive windows (peak 28.0 C of a 37 C target). The BED channel
+  exists for exactly this: its watch window is 60 s, not 20 s. Operator
+  note that settles it — on the real rig the probe is NOT bonded to the
+  pad, so every window gets smaller still. Staying on HE0 would require
+  `WATCH_TEMP_PERIOD` 20->60 and `WATCH_TEMP_INCREASE` 2->1 in
+  `Configuration_adv.h` (compile-time; no G-code reaches them).
+
+  ⚠ **Open question, disclosed:** at FULL duty the pad gained only
+  2.7 C/min at 28 C and was still short of 37 C. That is a heater-power /
+  insulation question independent of every fault above, and it may mean
+  this pad cannot hold 37 C in open air whichever output drives it.
+
+  ⚠ **The replacement board enumerates on a DIFFERENT port and serial**
+  (COM4 `2044328F4231` -> COM3 `2061328F4231`); `ME3B_2.json` still carries
+  `zp_stage.last_port: COM4`, which the app's probe corrects on the next
+  successful connect. Tools used: `tools_incubator_heater_diagnostic.py
+  --staircase` plus per-test transcripts under `logs/hwtest/`
+  (`he0_soak*.txt`, `he0_hold37.*`, `hb_retest.*`, `hb_newboard.*`).
+
+- **⭐ ROUND 6b — THE STAIRCASE IS AN OPTION IN THE APP** (operator: *"I
+  want these to be options in the incubator workflow somewhere"*). The bench
+  tool stays (it is the confound-free measurement, app closed, no ZP poller
+  traffic); this adds the same engine as a **Power staircase tab** on the
+  Incubator page, between Autotune and Sensor calibration. **ONE HOME FOR THE
+  MEASUREMENT:** NEW pure `SupportClasses/incubator/power_staircase.py` owns
+  the arithmetic *and the interpretation* — `plan_staircase`,
+  `p_gain_for_duty`, `rung_delivered`, `rung_overshot`, `StaircaseOutcome`
+  and `verdict_lines` — and the tool now IMPORTS them (verified `is`-identical
+  in both surfaces), because two copies of a verdict is how two surfaces come
+  to disagree about the same measurement. `DUTY_FULL` **aliases**
+  `marlin_gcode.HEATER_PWM_FULL_SCALE` rather than re-declaring 127, which
+  already had a home feeding the duty bar and the trend plot. **THREE HAZARDS
+  THE BENCH VERSION DOES NOT HAVE, each mutation-pinned. (1) The setpoint
+  keeps ONE writer:** a staircase drives the target directly, so the round-4
+  keeper and the round-3 dither would re-assert the operator's hold on top of
+  every rung and the measurement would be of the two fighting, not of the
+  supply — NEW `ZoneRuntime.diagnostic_active` makes both stand off, and the
+  tests guard-the-guard by proving the keeper DOES re-assert without it.
+  **(2) It refuses while a print owns the channel** (`_poll_permitted()`
+  False): the test is *expected* to reset the board, and on the shared link
+  that board runs Z and the pumps — resetting it mid-print is a crash, not a
+  diagnostic. The confirmation names that consequence (retract the needle;
+  the Z position must be re-declared after a reset) and defaults to No.
+  **(3) `mode="pid"` rewrites the bed PID**, so it REFUSES to start without a
+  copy of the gains it can put back, restores them on every exit path, and
+  **never sends M500** (pinned) — a diagnostic's pure-P gains must not become
+  permanent. **NOT refused on the shared link, unlike autotune, and the
+  difference is structural rather than a judgement call:** `M303` answers its
+  `ok` only when the whole tune ends — minutes to hours in ONE transaction
+  holding the motion board's lock — while the staircase is a handful of
+  ordinary short commands spaced a second apart, and it READS temperature and
+  duty from the existing 1 Hz sample stream instead of polling itself. For
+  the same reason it runs on **its own thread, not the command worker**: that
+  worker also services the poll, so occupying it would starve the very
+  stream the run reads. 🐞 **Two defects my own tests found. (a)** The verdict
+  trusted the REQUESTED percentage, so a bed already at the ceiling (duty 0,
+  no error to drive) reported *"Highest level SURVIVED: 100%"* — a false
+  all-clear that would send the operator hunting a software fault that is not
+  there; a rung now counts only if the MEASURED duty reached 60 % of the
+  request, with `NOTHING WAS PROVEN` when none did, and a pre-check refuses
+  to start within 1 °C of the ceiling. **(b)** A temperature abort DISCARDED
+  the rung it had just measured and then printed "nothing was proven" over a
+  log showing 99 % duty — the link carried that duty right up to the abort,
+  so it is recorded and the note says it is a lower bound. 🐞 **A third
+  found by reading the test log:** `_sc_apply` returned a bare bool, so an
+  UNANSWERED `M304` was reported as *refused* — round 3's rule is that only
+  an answered "no" is a verdict about the zone; a timeout is a link problem,
+  and calling it a refusal sends the operator after the wiring when the port
+  had simply gone. It now returns the failure KIND (`refused`/`dropped`).
+  ⚠ **NEW `rung_overshot` warning, and the simulator is why it exists:** a
+  firmware that ignores the gains runs every rung at full power, so an
+  operator who asked for 10 % would have applied 100 % — the verdict now says
+  **THE LEVEL WAS NOT LIMITED** and names the rungs, verified firing against
+  the thermal simulator (which does exactly that). Tests: NEW
+  `tests/test_v718_staircase_in_app.py` (**24**) + `test_v718_heater_staircase`
+  (**27**); **8/8 further mutations CAUGHT** (keeper stops standing off = the
+  two-writers bug · dither ditto · runs during a print · pid starts with no
+  gains to restore · the diagnostic flag left set, which would disable the
+  keeper forever · a timeout called a refusal · the confirmation removed · a
+  refused start leaving the tab's buttons dead). Regression **175 green**
+  (incubator backend 44 · shared link 31 · GUI 37 · staircase 51 · hygiene)
+  + a `gui.app` import smoke + a full staircase driven through the REAL page
+  against the simulator (buttons gate, rows stream at 1 Hz, verdict renders,
+  flag clears, PID restored). **Bench:** Incubator -> Power staircase, pick
+  peak-limited, Run, and send me the report (there is a Copy button).
+
+- **🔴🔴 ROUND 6 — BENCH 2026-08-17: "THE HEATER WON'T START" IS THE BOARD
+  LEAVING USB, NOT THE CONTROL PATH** (operator: *"the sensors work and it
+  plots the sensor temp … when I try to start the heater … maybe it should
+  start with a low voltage and come up. maybe we should have a manual mode
+  so i can debug."*). Root-caused from the operator's OWN telemetry — round
+  4's `log_on_connect` change is what made this readable, and it paid for
+  itself the first time it was needed. **The command path is CORRECT and the
+  heater WORKS:** every session logs `setpoint requested 37.0 commanded 37`
+  with no `command_refused`, and the bed physically climbed **22.3 → 33.3 °C
+  in 18 s at duty 100/127**. What fails is the link: in `app.log` the first
+  `WriteFile failed (PermissionError(13, …, 22))` — Windows
+  `ERROR_BAD_COMMAND`, the device gone mid-write — lands **0.45 s after
+  `M140 S37`** in the 16:06 session and **0.7 s after** it in the 16:09 one,
+  and the correlation is EXCLUSIVE: **0** write errors in the 35 s between
+  ZP connecting and the heater command, **0** across the 4-minute
+  heater-off window, then 50–104 per minute once it is on. Then the
+  documented cascade: link dies → poller-liveness declares ZP disconnected
+  → auto-reconnect opens the port → **DTR resets Marlin, clearing the
+  target** → round 4's keeper re-asserts → it heats for seconds → dies
+  again, which is why the card looks alive while nothing sustains. ⚠ **A
+  real hazard, disclosed:** in the 16:14 session the bed rose 22.3 → 33.3 °C
+  **while the board reported target 0.0 and duty 0.0** — during the
+  brownout/reconnect windows the heater was live and the software was blind
+  to it. No software soft-start makes that safe; it is why the electrical
+  fault is the first thing to fix. **Operator-supplied fact that narrowed
+  it:** VIN is **12 V** into a 12 V heater, so it is NOT the 24 V-rail
+  overvoltage case (which would have been 4× rated power) — leaving supply
+  capacity, inrush, or coupling. **DELIVERED: `--staircase` on
+  `tools_incubator_heater_diagnostic.py`** (operator chose the bench tool
+  over GUI work first — the round-4 precedent, and it removes the ZP
+  poller's ~3 Hz M114 traffic as a confound). It steps bed power up a rung
+  at a time and reports the highest level the USB link survives. **The
+  mechanism is the interesting part: Marlin has NO set-bed-PWM G-code** —
+  `M140` sets a target and the firmware picks the duty — so `--mode pid`
+  reduces the bed PID to pure proportional (`M304 P<k> I0 D0`), where
+  `pid_output = P·error` clamped to `MAX_BED_POWER` and `B@ = pid_output>>1`,
+  making the duty a chosen function of a known error; `p_gain_for_duty`
+  inverts that for a starting gain and one measured trim corrects it. `I` is
+  zeroed because integral windup would drift the duty off the level under
+  test; `D` because it chases sensor noise. **`--mode pwm` is the
+  differentiator, not a spare:** host-side slow PWM gates FULL-power bursts,
+  limiting average while every burst is full current — so pid surviving
+  where pwm dies at the same percentage proves the failure is peak/inrush,
+  which is exactly the condition under which an app-side duty cap would be a
+  real fix rather than a mask. **🔴 THE HONESTY RULE, and my own first cut
+  got it wrong:** the verdict initially trusted the REQUESTED percentage, so
+  a bed already at the ceiling (duty 0, no error to drive) reported
+  *"Highest level SURVIVED: 100%"* — a false all-clear that would send the
+  operator hunting a software fault that is not there. A rung now counts
+  only if the MEASURED duty reached 60 % of the request; otherwise it is
+  reported **not delivered / inconclusive**, `NOTHING WAS PROVEN` when no
+  rung loaded the link at all, and a pre-check refuses to start when the bed
+  is already within 1 °C of the ceiling. That also catches round 4's
+  upstream case (a board answering normally with duty stuck at 0). Both
+  defects were found by my own tests failing, not by review. Other
+  properties: the run **stops at the first killing rung** (every later
+  "result" would be a lie once the port is dead); **`silent` is never
+  conflated with `dropped`** (port-open-and-quiet is `kill()` needing a
+  power cycle; port-gone is a supply fault — different remedies); the bed
+  PID is **restored in every path and never written to EEPROM** (no `M500`,
+  so a power cycle also restores it), and `--mode pid` **REFUSES** when
+  `M503` reports no `M304` rather than leave gains it cannot put back;
+  `--mode pwm` never touches the PID at all. Tests: NEW
+  `tests/test_v718_heater_staircase.py` (**26**) driving the real
+  `staircase_test()` against a fake Marlin that browns out at a chosen duty
+  — a bench tool that crashes when it is needed is worthless, which is the
+  lesson already recorded for this file's first draft dying on an emoji
+  under cp1252, so the ASCII-purity check is pinned by test both on the
+  source bytes and on the rendered report encoding to cp1252. **6/6
+  mutations CAUGHT** (delivered-gate removed = the false all-clear ·
+  ceiling pre-check removed · PID restore removed · silent conflated with
+  dropped · staircase continues past a dead link · pwm mode rewriting the
+  PID). Regression **117 green** (staircase + incubator backend + GUI +
+  suite hygiene). **NOT built, deliberately:** the app-side soft start and
+  the GUI manual mode the operator suggested. Both are the right tools *if*
+  the staircase says the failure is peak current; if it dies at a low rung
+  the answer is heater resistance or supply capacity and a software cap
+  would only mask an uncontrolled heater. **Bench, in order:** close MEBP →
+  `python tools_incubator_heater_diagnostic.py --staircase` → note the
+  highest surviving rung → if it survives 100 %, re-run with the app open to
+  implicate the shared-port traffic; if it dies below 100 %, re-run
+  `--mode pwm` at that rung to separate peak from average; then measure the
+  heater resistance with everything powered off (at 12 V: `P = 144/R`,
+  `I = 12/R`) and compare against the PSU and the board's bed-output rating.
+
+- **⭐ ROUND 5 — the trend plot is resizable** (operator: *"the temperature
+  trend plot in the incubator is too wide, it needs to be resizable as
+  well."*). The upper area was a plain `QHBoxLayout` whose left pane —
+  the zone-card scroll — was `setFixedWidth(s(372))`, so the right column
+  absorbed **every** spare pixel: on a wide screen the plot rendered as a
+  very wide, very short strip with no handle anywhere to change it. The
+  sensor table underneath was `setFixedHeight(s(124))`, pinning the
+  vertical split too. Both fixed sizes became **floors**
+  (`setMinimumWidth` / `setMinimumHeight`) and both boundaries became
+  `QSplitter`s: horizontal (zone cards | right column) so width can be
+  handed back to the cards, vertical (trend | sensor table) so plot height
+  trades against table rows — which also means the sensor table can grow
+  at all, which it never could. Three details: **neither pane may collapse
+  to zero** (`setChildrenCollapsible(False)` — a pane dragged away is a
+  control surface the operator cannot find again); the plot gains a
+  **minimum WIDTH** beside its existing minimum height, since it now lives
+  between drag handles and the axis labels stop being readable well before
+  a pane reaches zero (measured non-binding on the page's minimum — the
+  trend group's control row already demands 616 px, so this changed no
+  layout minimum); and the horizontal stretch stays 0 : 1, i.e. window
+  growth still goes to the plot as before, so nothing about the default
+  look changed except that it can now be dragged. ⚠ **Honest limit:** on a
+  short window the trend and sensor panes sit AT their combined minimum,
+  so the vertical handle has no slack and does not move — verified: at
+  1600×950 it is inert, at 1600×1300 it drags freely. The dividers are not
+  persisted (the page is built once, so a drag survives navigation but not
+  a restart); writing layout state into the incubator store would race the
+  Hardware Setup tab's `load()`/`commit()` contract, which owns that file.
+  Tests: NEW `TestTrendPlotIsResizable` (**5** in
+  `test_v718_incubator_gui.py`, now 37) asserting the **drag**, not the
+  widget types — a splitter already at its minimums is still unmovable, so
+  each test moves a divider and measures the plot; **5/5 mutations CAUGHT**
+  (cards column fixed-width again = the original bug · sensor table
+  fixed-height again · either pane made collapsible · the plot's width
+  floor removed). Regression **124 green** (incubator gui + backend +
+  shared link + suite hygiene) and a `gui.app` import smoke.
+  `TempTrendPlot` has exactly one consumer, so the new floor has no other
+  blast radius.
+
 - **🔴🔴 ROUND 4 — BENCH SESSION 2026-08-13: THE HARDWARE WAS NEVER THE
   PROBLEM, AND THE HOLD HAD NO KEEPER.** Operator, after round 3: *"the
   heater is still not heating up, i have plugged the heater film directly
@@ -517,3 +831,202 @@ test_no_z_max_keeps_defaults` (both documented in CLAUDE.md), and
     holding it tracks `24.6 → 37 °C · 42%` and reads *heating* then *at
     target*; only Zone A's row appears (Zone B is disabled in this rig's
     config); the section survives a restart via the saved panel layout.
+
+---
+
+## ⭐⭐⭐⭐ ROUND 5 — THE HOLD OSCILLATES: PID RETUNED FROM THE LOG, HELD HOST-SIDE, NO EEPROM
+
+Operator, 2026-08-18: *"I just ran the incubator, and we can see that there is
+oscillation in the bed temperature around 37 degrees. From this signal can we
+tune the PID to fit in a tighter temperature range. I want 37.4 C +- 0.3 C as
+the expectation."* Then, on the remedy: *"I dont want to flash the board unless
+i really have to."*
+
+### What the signal actually says
+
+Source: `logs/incubator/incu_20260818_091055_hold.jsonl` (1 Hz, 8154 s).
+Settled window t=3880-7997 s:
+
+* period **588 s** (autocorrelation r = 0.93 — a strong, sustained limit cycle,
+  not drift);
+* peak-to-peak **1.15-2.06 °C**, sd 0.42 °C;
+* duty **railing at 0 % or 100 % for 55 % of samples**, mean 57 %.
+
+A duty that spends half its life on the rails is not regulating, it is
+bang-banging.
+
+**The confounder was cleared before any tuning conclusion was drawn.** The run
+logs seven `setpoint_reasserted` events, and a board that keeps forgetting its
+target would produce exactly this sawtooth by a completely different mechanism
+(round 4). All seven are at t=137-1075 s, i.e. **during the ramp**; from
+t=1507 s to t=8144 s the target sits at 37.0 with no reassertion and no change.
+So the oscillation is a genuine control limit cycle.
+
+### Plant identification, and why the obvious method fails
+
+Regressing dT/dt against T over the log gives nonsense (ambient 7.4 °C and
+31.7 °C on two attempts, against a log that *starts* at 21.3 °C with the heater
+off): the samples come from a closed loop where duty and temperature are
+correlated through the controller, and the full-power bursts are too short for
+the block to reach its quasi-steady rate. Classic closed-loop identification
+bias — recorded here because the first two attempts looked plausible.
+
+What is trustworthy is three measurements, and the model is fitted to exactly
+those three:
+
+1. **DC gain** — 57.0 % duty holds 36.90 °C against 21.3 °C ambient ⇒
+   K = 27.4 °C per unit duty;
+2. **|G(jω_u)| = 0.979 °C/unit-duty** and **∠G(jω_u) = −136.5°**, taken as the
+   fundamental Fourier components of duty and temperature at the limit-cycle
+   frequency. In a self-excited limit cycle u→y *is* the plant, so this is a
+   direct frequency-response measurement (relay-feedback identification), and
+   the oscillation (amp 0.57 °C) is far above the noise (σ 0.077 °C).
+
+Solving gives **K = 27.4 °C/unit-duty, τ = 2614 s (43.6 min), θ = 79 s**,
+θ/τ = 0.030 — strongly lag-dominant. Ceiling at 100 % duty ≈ 48.7 °C; 37.4 °C
+needs ≈ 59 % duty.
+
+**The model is validated by reproducing the fault.** Simulating the closed loop
+with the stock gains against this plant gives period **594 s vs 588 measured**,
+duty **57 % vs 57 %**, saturation **58 % vs 55 %**, mean **36.91 vs 36.90 °C**.
+A model that reproduces the observed limit cycle to 1 % on period is a model
+worth designing against.
+
+### Root cause
+
+Stock Ender-3 bed gains `M304 P41.78 I7.32 D158.93` ⇒ integral time
+Ti = Kp/Ki = **5.7 s**, against a water block whose time constant is **2614 s**.
+**Integral action 458× too fast.** Those gains are correct for a thin aluminium
+printer bed; the water block is a different plant by two orders of magnitude.
+Nothing was wrong with the heater, the wiring or the firmware.
+
+### The retune
+
+SIMC (Skogestad) with τ_c = 2θ: Kc = τ/(K(τ_c+θ)), Ti = min(τ, 4(τ_c+θ)).
+
+**`M304 P102.40 I0.11 D0.00`** (Ti = 931 s), phase margin 62°.
+
+| | true band | reported band | −3 °C ambient step |
+|---|---|---|---|
+| stock P41.78 I7.32 D158.93 | ±0.65 °C | — | — |
+| **P102.40 I0.11 D0.00** | **±0.015 °C** | ±0.28 °C | 0.32 °C, 23 min |
+
+Ladder, all simulated against the identified plant: `P153.6 I0.24` (τ_c=θ,
+PM 50°) recovers from a disturbance in 10 min instead of 23; `P76.8 I0.06`
+(τ_c=3θ, PM 68°) is the most robust but a 3 °C ambient step costs 0.59 °C.
+Stable across ±40 % error in K or τ individually and θ×3; only the compound
+worst case (K+40 % **and** τ−40 % **and** θ×2 simultaneously) destabilises the
+τ_c=2θ choice, and the model uncertainty is far smaller than that because it
+was fitted to a validated limit cycle.
+
+**D = 0 is deliberate, not an omission.** Swept 0/200/500/1000: derivative gave
+*no* overshoot reduction (+0.62 → +0.68 °C) while duty chatter went from 3 % to
+20 % against the 0.077 °C sensor noise. With θ/τ = 0.03 there is almost no dead
+time for D to anticipate.
+
+**Ki = 0.11, not 0.108.** `ZoneSpec.set_pid` formats M304 to two decimals (and
+tests pin that exact string), so the designed 0.108 would be silently truncated.
+0.11 was simulated and is indistinguishable — Ti 931 s vs 948 s, identical band,
+identical overshoot. Choosing a value that survives the format beats widening
+the format.
+
+### The remedy is host-side, and that is not merely a preference
+
+`M304` is a runtime command and `M500` writes EEPROM — **neither is a firmware
+flash**, and that was said plainly. But EEPROM is avoidable *and worth
+avoiding*: **a Marlin reset reverts the running gains to EEPROM**, and this
+board resets whenever its port is opened (DTR). That is the very mechanism
+behind round 4's forgotten setpoint. RAM-only gains would therefore snap back
+to the stock oscillating values on the next ZP reconnect **with nothing
+explaining why** — the 588 s limit cycle returning silently.
+
+So the gains are held in the per-machine store and re-asserted the same way the
+setpoint is:
+
+* `config_store` gains a per-zone `pid` block + `pid_apply_on_connect`, with
+  `parse_pid` **refusing** anything malformed/absurd rather than clamping — a
+  clamped gain is a *different controller than the one that was tuned*, applied
+  silently to a live heater. Absent is recoverable (the board keeps its own
+  gains); wrong is not. `Kp = 0` reads as "do not manage this zone".
+* `service.apply_store_config` *declares* them onto the controller
+  (`set_configured_pid`) — the controller deliberately does not read the store,
+  the same split the ceiling and zone labels already use.
+* `controller.apply_configured_pid()` pushes them on connect (unforced: the
+  probe has just read the board's real gains, so an already-matching push
+  correctly no-ops) and **forced** whenever the setpoint keeper catches a reset.
+* ⚠ **The `force` flag is load-bearing.** After a reset the board is back on
+  EEPROM gains but `rt.pid` still holds the *pre-reset* value, so an unforced
+  push would compare-equal, skip, and leave the stock gains in charge. Pinned
+  by `test_FORCE_pushes_even_when_the_cached_gains_match` and by a mutation.
+* The Hardware Setup → Incubator tab grows Kp/Ki/Kd per zone and the
+  re-assert checkbox, on the existing `load()`/`commit()` contract (nothing
+  written before Save, ONE `store.save()`), with `commit()` also pushing to a
+  LIVE controller so Save takes effect without a reconnect.
+
+### 🐞 Fixed en route: the ramp faked seven board resets
+
+`commanded_c` is updated the instant the ramp decides, while the G-code is still
+queued for the worker — so the board legitimately still reports the *previous*
+step for a sample or two, and the keeper's two-sample debounce was not enough.
+Every ramp step logged a false *"the board forgot its setpoint"*. Harmless to
+the hold, but it inflates the counter whose entire purpose is to make a
+genuinely rebooting board visible. New `REASSERT_GRACE_S = 6.0` measured from
+`_commanded_at`; pinned both ways (a fresh command is given time to land; a real
+reset is still caught once the grace expires).
+
+### ⚠ Disclosed, not fixed
+
+* **Warm-up overshoots ≈ +0.8 °C for ~20 min.** Slower integral action means
+  the integrator winds up over the hour-long climb, and Marlin's bed PID has
+  only a crude clamp (`MAX_BED_POWER/Ki`), no true anti-windup. Swept the ramp
+  lead 0.3-3.0 °C: it barely helps (+0.82 → +0.40 °C at a 0.3 °C lead, at the
+  cost of taking 102 min instead of 39 to reach target). What *does* work is
+  soaking below target for ≥ τ: 36.4 °C for 80 min then step to 37.4 gives
+  +0.13 °C and zero time out of band. In practice: warm up before loading cells.
+* **Sensor noise, not control error, is the binding limit on ±0.3 °C.**
+  σ = 0.077 °C, so the *reported* value scatters ±0.28 °C even with the block
+  dead steady at ±0.015 °C. 100 % of samples land inside ±0.3, but with almost
+  no margin. A 10 s smoother on the displayed value would give ±0.07 °C;
+  deliberately NOT added here, because a display filter also masks genuine
+  short excursions and that is a separate decision from tuning the loop.
+* **The gains are inferred, not read back.** The limit-cycle match plus
+  CLAUDE.md say the board is on `P41.78 I7.32 D158.93`; yesterday's power
+  staircase wrote `M304 P… I0 D0` but never `M500`, and today's session
+  DTR-reset the board, so EEPROM should be untouched. Confirm with `M503`.
+
+### Tests
+
+NEW `tests/test_v718_incubator_pid_tuning.py` (**25**): store round-trip and
+refusal matrix, apply-on-connect, the forced reset re-assert, diagnostic and
+`pid_available` stand-off, a refused push not claiming success, the ramp grace
+both ways, the service wiring, an AST pin that connect and the keeper both call
+`apply_configured_pid`, and the REAL Hardware Setup panel round-tripping gains
+(including Kp=0 clearing them and nothing being written before Save).
+
+Two existing keeper tests in `test_v718_incubator_backend.py` were **updated,
+not loosened**: a detected reset now submits two things (setpoint *and* PID
+re-assert), so counting raw submissions conflated them; they now count
+`_send_zone_cmd` specifically and a new helper exposes the PID re-asserts.
+
+### Needs real-HW verification on ME3B V1, IN ORDER
+
+1. `M503` on the Firmware/Console tab — confirm the bed line really reads
+   `P41.78 I7.32 D158.93` before changing anything.
+2. Connect ZP, open Workflows → Incubator. `logs/app.log` should carry
+   `incubator bed: applied PID Kp=102.40 Ki=0.11 Kd=0.00 (connect)` and the PID
+   tab should show the new values. **No `M500` anywhere.**
+3. Ramp Zone A to **37.4 °C**. Expect ~39 min to target and a warm-up peak
+   around 38.2 °C, then settling.
+4. **The payoff:** once settled, watch for ≥ 30 min. The duty should sit around
+   57-60 % and *stop railing*; the 588 s swing should be gone. Judge the block,
+   not the number — ±0.28 °C of the reported scatter is thermistor noise.
+5. **Provoke the reset path:** while holding, reconnect the ZP board. Expect
+   *"board forgot the setpoint"* **and** a second `applied PID … (board reset)`
+   line, and the hold must not resume oscillating.
+6. Confirm the ramp no longer logs false reassertions — the counter should stay
+   at 0 through a whole ramp.
+7. Hardware Setup → Incubator: change Kp, Save, and confirm it applies live
+   (`… (settings saved)` in the log) without a reconnect.
+8. If any residual oscillation remains, step down the ladder to
+   `P76.8 I0.06`; if disturbance recovery is too slow, step up to
+   `P153.6 I0.24`.

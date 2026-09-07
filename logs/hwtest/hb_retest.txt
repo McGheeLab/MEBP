@@ -1,0 +1,16 @@
+baseline  B(THB) 21.43   T(THO) 21.62
+
+STAGE 1 -- control: M140 S10, below ambient, MOSFET never switches
+  reply: ['//action:notification Bed Cooling...', 'ok']
+   [ctrl] t=   0.0s  B  21.43 (+0.00)  T  21.62 (+0.00)  bed duty   0/127
+   [ctrl] t=   5.1s  B  21.11 (-0.32)  T  21.78 (+0.16)  bed duty   0/127
+   [ctrl] survived 10s (peak bed duty 0/127)
+
+STAGE 2 -- the real test: M140 S37, 10 minutes
+  reply: ['//action:notification Bed Heating...', 'ok']
+   [hold] t=   0.0s  B  21.46 (+0.03)  T  21.64 (+0.02)  bed duty   0/127
+*** [hold] PORT DIED at 1.00s -- HB still crashes the board (SerialException)
+
+could not send off: SerialException
+
+VERDICT: port_died

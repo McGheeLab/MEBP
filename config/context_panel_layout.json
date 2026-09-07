@@ -31,6 +31,12 @@
       "id": "7b072bb28fdf449db172ae8d7213766a",
       "options": {},
       "collapsed": false
+    },
+    {
+      "type": "illumination",
+      "id": "b97693ef81194d2b9d4d73dbf3d0f8db",
+      "options": {},
+      "collapsed": false
     }
   ]
 }

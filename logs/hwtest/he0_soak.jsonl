@@ -1,0 +1,16 @@
+{"ev": "start", "T": 21.17, "T_tgt": 0.0, "B": 21.7, "duty": 0, "target": 37, "wall": "18:24:48"}
+{"ev": "command", "cmd": "M104 S37", "reply": ["//action:notification Ender-3 Ready.", "ok"], "wall": "18:24:48"}
+{"ev": "sample", "t": 0.0, "T": 21.17, "T_tgt": 37.0, "B": 21.7, "duty": 0, "wall": "18:24:48"}
+{"ev": "sample", "t": 2.0, "T": 21.33, "T_tgt": 37.0, "B": 21.82, "duty": 127, "wall": "18:24:50"}
+{"ev": "sample", "t": 4.0, "T": 20.9, "T_tgt": 37.0, "B": 21.99, "duty": 127, "wall": "18:24:52"}
+{"ev": "sample", "t": 6.0, "T": 20.98, "T_tgt": 37.0, "B": 21.39, "duty": 127, "wall": "18:24:54"}
+{"ev": "sample", "t": 8.0, "T": 21.43, "T_tgt": 37.0, "B": 21.76, "duty": 127, "wall": "18:24:56"}
+{"ev": "sample", "t": 10.0, "T": 20.92, "T_tgt": 37.0, "B": 21.74, "duty": 127, "wall": "18:24:58"}
+{"ev": "sample", "t": 12.0, "T": 21.33, "T_tgt": 37.0, "B": 21.43, "duty": 127, "wall": "18:25:00"}
+{"ev": "sample", "t": 14.0, "T": 21.07, "T_tgt": 37.0, "B": 22.15, "duty": 127, "wall": "18:25:02"}
+{"ev": "sample", "t": 16.1, "T": 21.27, "T_tgt": 37.0, "B": 21.72, "duty": 127, "wall": "18:25:04"}
+{"ev": "sample", "t": 18.1, "T": 21.23, "T_tgt": 37.0, "B": 21.33, "duty": 127, "wall": "18:25:06"}
+{"ev": "sample", "t": 20.1, "T": 21.07, "T_tgt": 37.0, "B": 21.87, "duty": 127, "wall": "18:25:09"}
+{"ev": "fault", "t": 22.06572439998854, "lines": ["echo:Heating Failed", "Error:Printer halted. kill() called!"], "wall": "18:25:11"}
+{"ev": "off", "reply": ["eroff"], "wall": "18:25:15"}
+{"ev": "end", "verdict": "fault", "elapsed": 56.3, "wall": "18:25:45"}

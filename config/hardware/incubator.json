@@ -10,14 +10,20 @@
   "heaters_off_on_app_exit": true,
   "zones": {
     "bed": {
-      "label": "",
+      "label": "Water block",
       "enabled": true,
-      "preset_c": 37.0
+      "preset_c": 37.4,
+      "pid": {
+        "kp": 102.4,
+        "ki": 0.11,
+        "kd": 0.0
+      }
     },
     "hotend": {
       "label": "",
       "enabled": false,
       "preset_c": 37.0
     }
-  }
+  },
+  "pid_apply_on_connect": true
 }
